@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OpenSnip.Overlay</RootNamespace>
+    <!-- 红线 §0.7:类库不引用 WPF,纯 Win32 + SkiaSharp -->
+    <UseWPF>false</UseWPF>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SPEC §4:SkiaSharp 3.x 最新稳定;Lead 2026-10-30 裁决定版 4.154.0(与 Core/Pin 一致,4.x 用 SKSamplingOptions 新采样 API) -->
+    <PackageReference Include="SkiaSharp" Version="4.154.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SPEC §0.9:Core 由契约 §2.1-2.7 提供,并行开发中,收口由 Lead 统一编译 -->
+    <ProjectReference Include="..\OpenSnip.Core\OpenSnip.Core.csproj" />
+  </ItemGroup>
+
+</Project>

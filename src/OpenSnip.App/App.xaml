@@ -1,0 +1,6 @@
+<Application x:Class="OpenSnip.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown">
+    <!-- 无主窗口:托盘常驻(StartupUri 缺省);退出只走托盘菜单/exit 命令(SPEC §3.4) -->
+</Application>

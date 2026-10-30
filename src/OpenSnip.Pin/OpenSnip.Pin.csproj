@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OpenSnip.Pin</RootNamespace>
+    <!-- 红线 §0.7:类库不引用 WPF/WinForms,纯 Win32 P/Invoke + SkiaSharp -->
+    <UseWPF>false</UseWPF>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SPEC §4:SkiaSharp。
+         版本对齐 OpenSnip.Core 的 4.154.0:ProjectReference 传递包依赖时 NuGet 统一取最高版本,
+         声明 3.x 只会产生"实际按 4.x 编译"的假象;版本仲裁权在 Lead(见交付报告)。 -->
+    <PackageReference Include="SkiaSharp" Version="4.154.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SPEC §0.9:引用 Core 的固定相对路径。
+         Core 由并行 agent 开发;Pin 源码仅按契约 §2 冻结签名调用 Core 公开类型
+         (PxRect/PxPoint/DisplayInfo/DisplayManager/NativeBitmap/BitmapConversion.WrapAsSkia)。 -->
+    <ProjectReference Include="..\OpenSnip.Core\OpenSnip.Core.csproj" />
+  </ItemGroup>
+
+</Project>

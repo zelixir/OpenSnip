@@ -1,0 +1,11 @@
+# 构建产物
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+# 运行时日志与验证图(不入库)
+logs/*.png
+logs/*.log
+# NuGet
+packages/

@@ -1,0 +1,249 @@
+using System.Diagnostics;
+using OpenSnip.App.CommandLine;
+using OpenSnip.Core;
+using OpenSnip.Overlay;
+
+namespace OpenSnip.App.Services;
+
+/// <summary>
+/// 截屏流程(SPEC §3.4):交互遮罩(SnipOverlay→Confirmed→剪贴板/存文件/Pin)与 --full/--area 直截。
+/// PerfLog 全链路打点:触发→冻结→遮罩→确认→各类输出完成。
+/// </summary>
+public sealed class SnipService : IDisposable
+{
+    private readonly object _gate = new();
+    private readonly StaWorker _sta;
+    private readonly OutputRunner _outputs;
+    private ScreenCaptureService? _capture;     // 全 App 生命周期一份,预热后复用 DD 会话
+    private SnipOverlay? _activeOverlay;
+    private bool _busy;
+
+    public SnipService(StaWorker sta, OutputRunner outputs)
+    {
+        _sta = sta;
+        _outputs = outputs;
+    }
+
+    // —— 交互式截屏(F1 / 托盘 / CLI snip)——
+
+    /// <summary>异步开始交互截屏;忙时拒绝(防 F1 重入)。遮罩期间不阻塞调用方(等待方 await 返回值)。</summary>
+    public Task<(bool Ok, string? Error)> StartInteractiveAsync(
+        string trigger, IReadOnlyList<OutputTarget> targets, double delaySeconds = 0)
+    {
+        lock (_gate)
+        {
+            if (_busy)
+            {
+                PerfLog.Log("App", $"snip:ignored-busy trigger={trigger}");
+                return Task.FromResult<(bool Ok, string? Error)>((false, "已有截屏正在进行中"));
+            }
+            _busy = true;
+        }
+        PerfLog.Log("App", $"snip:interactive-begin trigger={trigger} t={AppClock.ElapsedMs}ms");
+        return Task.Run(() => RunInteractiveAsync(trigger, targets, delaySeconds));
+    }
+
+    private async Task<(bool Ok, string? Error)> RunInteractiveAsync(
+        string trigger, IReadOnlyList<OutputTarget> targets, double delaySeconds)
+    {
+        var total = Stopwatch.StartNew();
+        try
+        {
+            if (delaySeconds > 0)
+            {
+                PerfLog.Log("App", $"snip:delay {delaySeconds}s");
+                Thread.Sleep((int)(delaySeconds * 1000));
+            }
+
+            var displays = DisplayManager.Instance.Displays;
+            if (displays.Count == 0)
+            {
+                return (false, "未枚举到任何显示器");
+            }
+            var capture = EnsureCapture();
+
+            var overlay = new SnipOverlay(displays, display =>
+            {
+                var bmp = capture.Capture(display); // DXGI 失败自动回退 BitBlt(§2.3)
+                PerfLog.Log("App", $"snip:freeze display={display.Index} {bmp.Width}x{bmp.Height} mode={capture.LastUsedMode} t={AppClock.ElapsedMs}ms");
+                return bmp;
+            });
+
+            var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            overlay.Confirmed += result =>
+            {
+                try
+                {
+                    PerfLog.Log("App", $"snip:confirmed rect={result.PhysicalRect.X},{result.PhysicalRect.Y} {result.PhysicalRect.Width}x{result.PhysicalRect.Height} display={result.Display.Index} total={total.Elapsed.TotalMilliseconds:F1}ms");
+                    // 选区来源 ⇒ 贴回原位(result.PhysicalRect);pin 存在则所有权转移给 PinWindow(§2.9)
+                    bool pinned = _outputs.Run(result.Image, result.PhysicalRect, targets);
+                    if (!pinned)
+                    {
+                        result.Image.Dispose(); // 无 pin 输出:App 负责释放
+                    }
+                    PerfLog.Log("App", $"snip:outputs-done total={total.Elapsed.TotalMilliseconds:F1}ms");
+                }
+                catch (Exception ex)
+                {
+                    PerfLog.Log("App", $"snip:outputs-failed {ex}");
+                    result.Image.Dispose();
+                }
+                finally
+                {
+                    done.TrySetResult(true);
+                }
+            };
+            overlay.Cancelled += () =>
+            {
+                PerfLog.Log("App", $"snip:cancelled total={total.Elapsed.TotalMilliseconds:F1}ms");
+                done.TrySetResult(false);
+            };
+
+            lock (_gate) { _activeOverlay = overlay; }
+            overlay.Start();
+            PerfLog.Log("App", $"snip:overlay-start-returned {total.Elapsed.TotalMilliseconds:F1}ms");
+
+            var confirmed = await done.Task; // 事件在遮罩内部线程触发后落定(Close() 亦视同取消)
+            return (confirmed, confirmed ? null : "已取消");
+        }
+        catch (Exception ex)
+        {
+            PerfLog.Log("App", $"snip:error {ex}");
+            return (false, ex.Message);
+        }
+        finally
+        {
+            lock (_gate) { _activeOverlay = null; _busy = false; }
+            PerfLog.Log("App", $"snip:end total={total.Elapsed.TotalMilliseconds:F1}ms");
+        }
+    }
+
+    // —— 直接截取(--full / --area,无遮罩)——
+
+    public Task<(bool Ok, string? Error)> CaptureDirectAsync(
+        SnipMode mode, int x, int y, int w, int h, IReadOnlyList<OutputTarget> targets, double delaySeconds)
+        => Task.Run(() => RunDirect(mode, x, y, w, h, targets, delaySeconds));
+
+    private (bool Ok, string? Error) RunDirect(
+        SnipMode mode, int x, int y, int w, int h, IReadOnlyList<OutputTarget> targets, double delaySeconds)
+    {
+        var total = Stopwatch.StartNew();
+        try
+        {
+            if (delaySeconds > 0)
+            {
+                PerfLog.Log("App", $"snip:delay {delaySeconds}s");
+                Thread.Sleep((int)(delaySeconds * 1000));
+            }
+
+            var displays = DisplayManager.Instance.Displays;
+            if (displays.Count == 0)
+            {
+                return (false, "未枚举到任何显示器");
+            }
+            var capture = EnsureCapture();
+
+            DisplayInfo display;
+            if (mode == SnipMode.Full)
+            {
+                display = displays.FirstOrDefault(d => d.IsPrimary) ?? displays[0];
+            }
+            else
+            {
+                var center = new PxPoint(x + w / 2, y + h / 2);
+                display = DisplayManager.Instance.GetDisplayAt(center)
+                    ?? DisplayManager.Instance.GetDisplayByIndex(0)
+                    ?? throw new InvalidOperationException($"无法定位区域中心 {center.X},{center.Y} 所在显示器");
+            }
+
+            var swCapture = Stopwatch.StartNew();
+            var shot = capture.Capture(display);
+            swCapture.Stop();
+            PerfLog.Log("App", $"snip:direct-capture display={display.Index}({display.DeviceName}) mode={capture.LastUsedMode} {swCapture.Elapsed.TotalMilliseconds:F1}ms");
+
+            NativeBitmap image;
+            PxRect outRect;
+            if (mode == SnipMode.Full)
+            {
+                image = shot;
+                outRect = display.Bounds;
+            }
+            else
+            {
+                var clip = Intersect(new PxRect(x, y, w, h), display.Bounds);
+                if (clip.IsEmpty)
+                {
+                    shot.Dispose();
+                    return (false, $"区域 {x},{y} {w}x{h} 不与显示器 {display.DeviceName}({display.Bounds}) 相交");
+                }
+                // 契约 §2.2:CopyRegionFrom 按目标尺寸从冻结整屏取子区
+                image = NativeBitmap.Allocate(clip.Width, clip.Height);
+                try
+                {
+                    image.CopyRegionFrom(shot, clip.X - display.Bounds.X, clip.Y - display.Bounds.Y);
+                }
+                catch
+                {
+                    image.Dispose();
+                    throw;
+                }
+                finally
+                {
+                    shot.Dispose(); // 全屏中间产物即刻释放
+                }
+                outRect = clip;
+            }
+
+            bool pinned = _outputs.Run(image, outRect, targets);
+            if (!pinned)
+            {
+                image.Dispose();
+            }
+            PerfLog.Log("App", $"snip:direct-done mode={mode} rect={outRect.X},{outRect.Y} {outRect.Width}x{outRect.Height} total={total.Elapsed.TotalMilliseconds:F1}ms");
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            PerfLog.Log("App", $"snip:direct-error {ex}");
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>物理像素矩形求交(不相交返回 PxRect.Empty)。</summary>
+    private static PxRect Intersect(PxRect a, PxRect b)
+    {
+        int left = Math.Max(a.X, b.X);
+        int top = Math.Max(a.Y, b.Y);
+        int right = Math.Min(a.X + a.Width, b.X + b.Width);
+        int bottom = Math.Min(a.Y + a.Height, b.Y + b.Height);
+        return right > left && bottom > top ? new PxRect(left, top, right - left, bottom - top) : PxRect.Empty;
+    }
+
+    /// <summary>惰性创建截屏服务(预热与首截共用同一实例,复用 DD 会话)。</summary>
+    internal ScreenCaptureService EnsureCapture()
+    {
+        lock (_gate)
+        {
+            return _capture ??= new ScreenCaptureService();
+        }
+    }
+
+    /// <summary>退出时若遮罩开着,强制关闭(视同取消,§2.8)。</summary>
+    public void CloseActiveOverlay()
+    {
+        lock (_gate)
+        {
+            try { _activeOverlay?.Close(); } catch { /* Overlay 侧自兜底 */ }
+        }
+    }
+
+    public void Dispose()
+    {
+        CloseActiveOverlay();
+        lock (_gate)
+        {
+            _capture?.Dispose();
+            _capture = null;
+        }
+    }
+}

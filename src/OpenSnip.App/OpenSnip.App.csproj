@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OpenSnip.App</RootNamespace>
+    <!-- 红线 §0.7:只有 App 引 WPF -->
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>false</UseWindowsForms>
+    <!-- SPEC §3.4:app.manifest(PerMonitorV2 + asInvoker) -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <Version>0.1.0</Version>
+    <Product>OpenSnip</Product>
+    <AssemblyName>OpenSnip.App</AssemblyName>
+<NoWarn>$(NoWarn)</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SPEC §4:App 层 NuGet 依赖(H.NotifyIcon 托盘)。
+         注:H.NotifyIcon 2.4.x 已拆包——基包仅含纯 net10.0 互操作,TaskbarIcon 移至 H.NotifyIcon.Wpf(同版本) -->
+    <PackageReference Include="H.NotifyIcon" Version="2.4.1" />
+    <PackageReference Include="H.NotifyIcon.Wpf" Version="2.4.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SPEC §0.9:Core/Overlay/Pin 并行开发中,缺产物属预期,收口由 Lead 统一编译 -->
+    <ProjectReference Include="..\OpenSnip.Core\OpenSnip.Core.csproj" />
+    <ProjectReference Include="..\OpenSnip.Overlay\OpenSnip.Overlay.csproj" />
+    <ProjectReference Include="..\OpenSnip.Pin\OpenSnip.Pin.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 托盘图标资源(pack URI 加载),兼作 exe 图标 -->
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
+
+</Project>
