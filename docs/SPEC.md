@@ -322,3 +322,8 @@ public sealed class SnipOverlay {
   4. 真实 DD 截屏内容的正确性已由 M1 实测 + 34 项单测覆盖,不在隐藏桌面重复验证
 - **单一驱动原则**:E2E 运行窗口内,只允许 e2e-dev 的脚本驱动 OpenSnip.TestRpc;其他 agent 的自测在 E2E 运行期间必须停手避让(2026-10-31 08:18 曾发生双驱动争用同一管道)。
 - **vdesk --args 语法注意**:background-gui W.cs 已支持 `--args=--test-rpc`(显式赋值,值可含 --);旧空格绕法 `--args ' --test-rpc'` 仍兼容。
+
+
+### 8.5 PrintWindow 隐藏桌面限制与 overlay.snapshot(2026-10-31 实证裁决 #2)
+- **实证**:vdesk shot 的 PW_RENDERFULLCONTENT 依赖 DWM 合成,而**隐藏桌面窗口不进 DWM 合成树** → 隐藏桌面下遮罩 shot 全黑与窗口实际内容无关(perf.log 已证 TEST-PATTERN 生成 + FirstFrame draw+ULW=18.98ms 提交成功)。PrintWindow 在隐藏桌面为 best-effort,E2E 中降级为 warn 不 fail。
+- **替代强断言:RPC 新命令 `{"cmd":"overlay.snapshot","out":"PNG路径"}`** —— 进程内把活动遮罩窗口的渲染 DIB 直接编码导出(与 ULW 提交同一块内存),返回 `{"ok":true,"w":N,"h":N}`;无活动遮罩返回 ok:false。E2E 的遮罩渲染断言(色带/选区框/锚点)全部基于 snapshot 的 PNG,PrintWindow 结果仅作参考记录。

@@ -51,16 +51,17 @@ internal sealed class OverlayRenderer
     private SKPaint P(ref SKPaint? field, Func<SKPaint> make) => field ??= make();
 
     private SKPaint FrozenPaint => P(ref _paintFrozen, () => new SKPaint { IsAntialias = false });
-    private SKPaint MaskSrcPaint => P(ref _paintMaskSrc, () => new SKPaint
+    private SKPaint MaskPaint => P(ref _paintMaskSrc, () => new SKPaint
     {
-        Color = new SKColor(0, 0, 0, 128),       // SPEC:50% 黑遮罩
-        BlendMode = SKBlendMode.Src,             // 替换写 = 清屏 + 遮罩合一遍
+        // SPEC:50% 黑遮罩。必须 SrcOver(alpha 混合保留底下冻结画面)!
+        // 曾误用 Src 整像素替换 → DIB 全被替换成纯黑遮罩色,渲染输出全暗(E2E 20261031-141858)。
+        Color = new SKColor(0, 0, 0, 128),
         IsAntialias = false,
     });
-    private SKPaint DarkenSrcPaint => P(ref _paintDarkenSrc, () => new SKPaint
+    private SKPaint DarkenPaint => P(ref _paintDarkenSrc, () => new SKPaint
     {
+        // 选区外加深:同上,SrcOver 叠加(177 = 50% 全屏遮罩 + 39% 加深的合成等效单层)
         Color = new SKColor(0, 0, 0, OutsideAlpha),
-        BlendMode = SKBlendMode.Src,
         IsAntialias = false,
     });
     private SKPaint HighlightFillPaint => P(ref _paintHighlightFill, () => new SKPaint { Color = new SKColor(0x00, 0xA8, 0xFF, 40) });
@@ -106,25 +107,35 @@ internal sealed class OverlayRenderer
 
     private SKTypeface Typeface => _typeface ??= SKTypeface.FromFamilyName("Segoe UI") ?? SKTypeface.Default;
 
-    /// <summary>绘制一帧。canvas 为窗口背衬;遮罩矩形(Src 模式)保证旧帧内容不残留。</summary>
+    /// <summary>
+    /// 绘制一帧。canvas 为窗口背衬。
+    /// 清屏策略:冻结画面 blit(源全不透明)本身即整窗替换,无需独立 Clear 遍;
+    /// 仅捕获失败(无冻结画面)时 Clear 兜底,防止旧帧残留(放大镜拖尾等)。
+    /// </summary>
     public void DrawFrame(SKCanvas canvas, in RenderModel m)
     {
         var bounds = new SKRect(0, 0, m.WindowWidth, m.WindowHeight);
 
-        // 1) 冻结画面 1:1 blit(源经 EnsureOpaque 保证全不透明 → SrcOver 即替换)
+        // 1) 冻结画面 1:1 blit(源经 EnsureOpaque 保证全不透明 → SrcOver 即整窗替换 = 隐式清屏)
         if (m.Frozen is not null)
+        {
             canvas.DrawImage(m.Frozen, bounds, bounds, SKSamplingOptions.Default, FrozenPaint); // Default=最近邻,1:1 blit
+        }
+        else
+        {
+            canvas.Clear(SKColors.Transparent); // 无画面兜底:罕见路径,不追求零成本
+        }
 
-        // 2) 遮罩(一遍写):有选区 → "回"形四矩形(选区内全亮);无选区 → 全屏 50%
+        // 2) 遮罩(SrcOver 叠加):有选区 → "回"形四矩形(选区内全亮);无选区 → 全屏 50%
         if (m.Selection is { } sel)
         {
             var local = ToLocal(m, sel);
             float L = local.Left, T = local.Top, R = local.Right, B = local.Bottom;
             float W = m.WindowWidth, H = m.WindowHeight;
-            FillSrc(canvas, 0, 0, W, T);
-            FillSrc(canvas, 0, B, W, H - B);
-            FillSrc(canvas, 0, T, L, B - T);
-            FillSrc(canvas, R, T, W - R, B - T);
+            FillDarken(canvas, 0, 0, W, T);
+            FillDarken(canvas, 0, B, W, H - B);
+            FillDarken(canvas, 0, T, L, B - T);
+            FillDarken(canvas, R, T, W - R, B - T);
 
             // 3) 选区元素:边框 1px 红 / 8 锚点白方块 / 右上尺寸标签
             canvas.DrawRect(local, SelectionBorderPaint);
@@ -133,7 +144,7 @@ internal sealed class OverlayRenderer
         }
         else
         {
-            canvas.DrawRect(bounds, MaskSrcPaint);
+            canvas.DrawRect(bounds, MaskPaint);
 
             // 窗口悬停高亮(仅空闲;拖拽后消失,SPEC §3.2)
             if (m.HighlightWindow is { } hl)
@@ -165,10 +176,10 @@ internal sealed class OverlayRenderer
         canvas.DrawRect(local, HighlightBorderPaint);
     }
 
-    private void FillSrc(SKCanvas canvas, float x, float y, float w, float h)
+    private void FillDarken(SKCanvas canvas, float x, float y, float w, float h)
     {
         if (w <= 0 || h <= 0) return;
-        canvas.DrawRect(new SKRect(x, y, x + w, y + h), DarkenSrcPaint);
+        canvas.DrawRect(new SKRect(x, y, x + w, y + h), DarkenPaint);
     }
 
     private void DrawAnchors(SKCanvas canvas, in RenderModel m, PxRect sel)

@@ -25,6 +25,7 @@ internal static class WM
     public const uint APP_SETREGION = 0x8001;
     public const uint APP_CONFIRM = 0x8002;
     public const uint APP_CANCEL = 0x8003;
+    public const uint APP_SNAPSHOT = 0x8004; // §8.5:渲染 DIB 进程内导出(wParam=cookie)
 }
 
 /// <summary>杂项 Win32 常量。</summary>

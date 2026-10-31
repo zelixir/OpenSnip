@@ -2,6 +2,7 @@
 //   Start() 创建内部 STA 线程 → 逐屏回调 capture 冻结画面 → 每屏建 ULW 遮罩窗口 → GetMessage 循环。
 //   事件 Confirmed/Cancelled 均在内部线程触发;Close() 线程安全(视同 Cancelled)。
 //   PerfLog 打点:capture 耗时 / Start()→首帧 ULW 提交 / 确认→裁剪完成(§3.2)。
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -70,6 +71,12 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         // 窗口尚未创建时:线程建窗循环与消息循环入口都会检查 _closeRequested
     }
 
+    // —————————————————— §8.5 快照导出(vdesk 无头 E2E)——————————————————
+    // cookie → 完成源:PostMessage APP_SNAPSHOT 到内部线程,EncodeSnapshot 在该线程
+    // 与 RenderFrame/Commit 同线程执行(无撕裂),结果经 TCS 回调用方。
+    private int _snapshotCookie;
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<(byte[]? Png, int W, int H)>> _snapshots = new();
+
     // —————————————————— §8.1 测试驱动(vdesk 无头 E2E)——————————————————
     // 与 Close() 相同的封送机制:PostMessage 到内部 UI 线程,由 HandleMessage 在
     // 既有状态机上执行并照常重绘/触发事件。遮罩未激活(窗口未建/已退出)时为 no-op。
@@ -99,6 +106,31 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         long hwnd = Interlocked.Read(ref _firstHwnd);
         if (hwnd == 0) return;
         NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_CANCEL, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// §8.5 线程安全:把活动遮罩的渲染 DIB(与 ULW 提交同一内存)编码为 PNG。
+    /// 与 Post* 同封送通道(APP_SNAPSHOT → 内部线程编码),同步等待 ≤5s;
+    /// 无活动遮罩(窗口未建/已退出)或超时返回 null。
+    /// </summary>
+    public (byte[] Png, int Width, int Height)? SnapshotPng()
+    {
+        long hwnd = Interlocked.Read(ref _firstHwnd);
+        if (hwnd == 0) return null;
+        int cookie = Interlocked.Increment(ref _snapshotCookie);
+        var tcs = new TaskCompletionSource<(byte[]? Png, int W, int H)>(
+            System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+        _snapshots[cookie] = tcs;
+        NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_SNAPSHOT, new IntPtr(cookie), IntPtr.Zero);
+        if (!tcs.Task.Wait(TimeSpan.FromSeconds(5)))
+        {
+            _snapshots.TryRemove(cookie, out _);
+            PerfLog.Log("Overlay.Snapshot", "timeout(内部线程 5s 未应答)");
+            return null;
+        }
+        _snapshots.TryRemove(cookie, out _);
+        var r = tcs.Task.Result;
+        return r.Png is null ? null : (r.Png, r.W, r.H);
     }
 
     public void Dispose()
@@ -178,6 +210,24 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                 {
                     PerfLog.Log("Overlay.FirstFrame", $"display={w.Display.Index} FAILED: {ex.Message}");
                 }
+
+                // 内容级自检:首帧后直读 DIB 抽样,全暗(<0.1% 非黑)说明渲染管线断裂
+                // (如 E2E 20261031-141858:Src 遮罩把画面整像素替换成纯黑)。防无声回归。
+                try
+                {
+                    double nonBlack = w.SampleNonBlackRatio();
+                    if (nonBlack < 0.001)
+                        PerfLog.Log("Overlay.FirstFrame",
+                            $"WARN content all-dark display={w.Display.Index} nonBlack={nonBlack:P2} (<0.1%, 冻结画面缺失?)");
+                    else
+                        PerfLog.Log("Overlay.FirstFrame",
+                            $"contentCheck display={w.Display.Index} nonBlack={nonBlack:P2}");
+                }
+                catch (Exception ex)
+                {
+                    PerfLog.Log("Overlay.FirstFrame", $"contentCheck FAILED display={w.Display.Index}: {ex.Message}");
+                }
+
                 NativeMethods.ShowWindow(w.Handle, Win32.SW_SHOWNA);
             }
 
@@ -330,6 +380,28 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                 case WM.APP_CANCEL: // §8.1:与 VK_ESCAPE 完全同分支
                     NativeMethods.PostQuitMessage(0);
                     return true;
+
+                case WM.APP_SNAPSHOT: // §8.5 测试驱动:进程内导出渲染 DIB(wParam=cookie)
+                {
+                    int cookie = unchecked((int)(long)wParam);
+                    if (_snapshots.TryRemove(cookie, out var tcs))
+                    {
+                        try
+                        {
+                            // 主屏窗口(E2E 单屏场景即唯一窗口),语义稳定
+                            var target = _windows.Find(x => x.Display.IsPrimary) ?? _windows[0];
+                            var (png, cw, ch) = target.EncodeSnapshot();
+                            PerfLog.Log("Overlay.Snapshot", $"encoded {cw}x{ch} bytes={png.Length}");
+                            tcs.TrySetResult((png, cw, ch));
+                        }
+                        catch (Exception ex)
+                        {
+                            PerfLog.Log("Overlay.Snapshot", $"encode FAILED: {ex.Message}");
+                            tcs.TrySetResult((null, 0, 0));
+                        }
+                    }
+                    return true;
+                }
 
                 case WM.KEYDOWN:
                 case WM.SYSKEYDOWN:

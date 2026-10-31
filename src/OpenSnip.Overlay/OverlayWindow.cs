@@ -45,6 +45,7 @@ internal sealed class OverlayWindow : IDisposable
     private readonly IntPtr _screenDc;      // GetDC(null),ULW 的 hdcDst
     private readonly IntPtr _memDc;         // CreateCompatibleDC,已选入 DIB
     private readonly IntPtr _dib;           // CreateDIBSection 句柄
+    private readonly IntPtr _dibBits;       // DIB 内存(内容级自检直读)
     private readonly SKBitmap _backbuffer;  // wrap DIB 位(不拷贝)
     private readonly SKCanvas _canvas;      // 直接画进背衬(SPEC §3.2 性能要点)
     private SKImage? _frozenImage;
@@ -62,6 +63,7 @@ internal sealed class OverlayWindow : IDisposable
         _screenDc = screenDc;
         _memDc = memDc;
         _dib = dib;
+        _dibBits = bits;
         _backbuffer = backbuffer;
         _canvas = new SKCanvas(_backbuffer);
     }
@@ -157,6 +159,19 @@ internal sealed class OverlayWindow : IDisposable
         Commit();
     }
 
+    /// <summary>
+    /// §8.5:把背衬 DIB(与 ULW 提交同一块内存)编码为 PNG。必须在 Overlay 线程调用
+    /// (与 RenderFrame/Commit 同线程,天然无撕裂)。
+    /// </summary>
+    internal (byte[] Png, int Width, int Height) EncodeSnapshot()
+    {
+        var pixmap = _backbuffer.PeekPixels()
+            ?? throw new InvalidOperationException("背衬 SKBitmap 无像素映射(ULW DIB 未就绪)");
+        using var image = SKImage.FromPixels(pixmap);
+        using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+        return (data.ToArray(), Width, Height);
+    }
+
     /// <summary>把背衬 DIB 全窗口提交到屏幕(§3.2 简化:不做失效矩形,单帧全量)。</summary>
     public bool Commit()
     {
@@ -172,6 +187,42 @@ internal sealed class OverlayWindow : IDisposable
     public static OverlayWindow? FromHandle(IntPtr hwnd)
     {
         lock (Map) return Map.TryGetValue(hwnd, out var w) ? w : null;
+    }
+
+    // —————————————————— 内容级自检(SPEC §8 / E2E 防无声回归)——————————————————
+
+    /// <summary>
+    /// 直读背衬 DIB 的一个像素(预乘 BGRA),返回 (R,G,B)。仅 Overlay UI 线程调用。
+    /// </summary>
+    internal unsafe (byte R, byte G, byte B) SamplePixel(int x, int y)
+    {
+        x = Math.Clamp(x, 0, Width - 1);
+        y = Math.Clamp(y, 0, Height - 1);
+        byte* p = (byte*)_dibBits + (long)y * (Width * 4) + (long)x * 4;
+        return (p[2], p[1], p[0]); // BGRA 内存序 → RGB
+    }
+
+    /// <summary>
+    /// 网格抽样统计"非黑像素"比例(R/G/B 任一 &gt; 8 视为非黑)。
+    /// 用途:首帧渲染后自检——遮罩底下必须能看到冻结画面,若全暗说明渲染管线断了(如
+    /// E2E 20261031-141858 的 Src 遮罩替换事故)。UI 线程调用。
+    /// </summary>
+    internal unsafe double SampleNonBlackRatio(int cols = 64, int rows = 64, byte threshold = 8)
+    {
+        int total = 0, nonBlack = 0;
+        for (int ry = 0; ry < rows; ry++)
+        {
+            int y = (ry + 1) * Height / (rows + 1);
+            byte* row = (byte*)_dibBits + (long)y * (Width * 4);
+            for (int rx = 0; rx < cols; rx++)
+            {
+                int x = (rx + 1) * Width / (cols + 1);
+                byte* p = row + (long)x * 4;
+                total++;
+                if (p[0] > threshold || p[1] > threshold || p[2] > threshold) nonBlack++;
+            }
+        }
+        return total == 0 ? 0 : (double)nonBlack / total;
     }
 
     private static IntPtr WndProcStatic(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)

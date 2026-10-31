@@ -168,9 +168,48 @@ public sealed class TestRpcService : IAsyncDisposable
                 var (ok, err) = _paste();
                 return ok ? Ok() : Err(err ?? "贴图失败");
             }
+            case "overlay.snapshot":
+                return OverlaySnapshot(root);
             default:
                 return Err($"未知命令:{cmdEl.GetString()}");
         }
+    }
+
+    /// <summary>
+    /// overlay.snapshot(§8.5):进程内把活动遮罩渲染 DIB 编码 PNG 写 out 路径;响应 {ok,w,h}。
+    /// 无活动遮罩/导出失败 → ok:false。
+    /// </summary>
+    private string OverlaySnapshot(JsonElement root)
+    {
+        if (!root.TryGetProperty("out", out var outEl) || outEl.ValueKind != JsonValueKind.String)
+        {
+            return Err("overlay.snapshot 需要字符串 out(PNG 路径)");
+        }
+        var path = Environment.ExpandEnvironmentVariables(outEl.GetString()!);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return Err("out 为空");
+        }
+        var overlay = _activeOverlay();
+        if (overlay is null)
+        {
+            return Err("无遮罩活动");
+        }
+        var snap = overlay.SnapshotPng();
+        if (snap is null || snap.Value.Png is null)
+        {
+            return Err("快照导出失败(无窗口/超时)");
+        }
+        var (png, w, h) = snap.Value;
+        var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+        File.WriteAllBytes(path, png);
+        PerfLog.Log("App", $"test-rpc:overlay-snapshot out={path} {w}x{h} bytes={png.Length}");
+        return JsonSerializer.Serialize(
+            new Dictionary<string, object?> { ["ok"] = true, ["w"] = w, ["h"] = h }, JsonOpts);
     }
 
     /// <summary>遮罩驱动命令的公共壳:无活动遮罩 → ok:false(§8.2 setRegion/confirm 语义,cancel 同口径)。</summary>
