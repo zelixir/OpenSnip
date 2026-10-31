@@ -20,6 +20,11 @@ internal static class WM
     public const uint LBUTTONDBLCLK = 0x0203;
     public const uint RBUTTONDOWN = 0x0204;
     public const uint MOUSEWHEEL = 0x020A;
+
+    // —— §8.1 测试驱动 Post*(内部线程封送,与 WM.APP 基址段区分)——
+    public const uint APP_SETREGION = 0x8001;
+    public const uint APP_CONFIRM = 0x8002;
+    public const uint APP_CANCEL = 0x8003;
 }
 
 /// <summary>杂项 Win32 常量。</summary>

@@ -19,6 +19,7 @@ public sealed record CliOptions(
     bool Ok,
     string? Error,
     bool Block,
+    bool TestRpc,
     CliCommandKind Command,
     SnipMode Mode,
     int AreaX, int AreaY, int AreaW, int AreaH,
@@ -27,7 +28,7 @@ public sealed record CliOptions(
     bool HasExplicitOutputs)
 {
     public static CliOptions Fail(string error) => new(
-        Ok: false, Error: error, Block: false, CliCommandKind.None, SnipMode.Interactive,
+        Ok: false, Error: error, Block: false, TestRpc: false, CliCommandKind.None, SnipMode.Interactive,
         0, 0, 0, 0, 0, Array.Empty<OutputTarget>(), HasExplicitOutputs: false);
 }
 
@@ -64,6 +65,7 @@ public static class CommandLineParser
             var outputs = new List<OutputTarget>();
             bool explicitOutputs = false;
             bool block = false;
+            bool testRpc = false;
 
             for (int i = 0; i < args.Count; i++)
             {
@@ -72,6 +74,13 @@ public static class CommandLineParser
                 {
                     case "--block":
                         block = true; // 全局开关(SPEC §3.4 --block 语义)
+                        break;
+                    case "--test-rpc":
+                        testRpc = true; // 全局开关(§8.2:测试模式,跳过单实例仲裁)
+                        break;
+                    case "--config":
+                        // §8.2 预留("--test-rpc 可与 --config 并用"):v1 消费其值但不使用
+                        if (i + 1 < args.Count) i += 1;
                         break;
                     case "snip":
                         if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
@@ -134,7 +143,7 @@ public static class CommandLineParser
                         return CliOptions.Fail(tok.StartsWith('-') ? $"未知选项:{tok}" : $"无法识别的参数:{tok}");
                 }
             }
-            return new CliOptions(true, null, block, command, mode, ax, ay, aw, ah, delay, outputs, explicitOutputs);
+            return new CliOptions(true, null, block, testRpc, command, mode, ax, ay, aw, ah, delay, outputs, explicitOutputs);
         }
         catch (Exception ex)
         {

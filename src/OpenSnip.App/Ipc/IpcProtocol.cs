@@ -75,7 +75,8 @@ public static class IpcProtocol
         return (false, line.Length == 0 ? "首实例异常断开" : line);
     }
 
-    private static async Task<string> ReadLineAsync(PipeStream pipe, CancellationToken ct)
+    /// <summary>读一行('\n' 终止);对端断开(EOF)返回空串。internal:测试 RPC(SPEC §8.2)复用同一行协议。</summary>
+    internal static async Task<string> ReadLineAsync(PipeStream pipe, CancellationToken ct)
     {
         var buf = new MemoryStream(); // 行内容很短(命令行参数),托管缓冲可接受(非位图数据,不触红线 §0.4)
         var one = new byte[1];

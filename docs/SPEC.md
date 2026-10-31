@@ -269,3 +269,56 @@ public static class PinManager
 - 完成时:在最终消息中列出:创建的文件清单、build 结果(命令与输出摘要)、偏离契约之处(如有)、待联调风险点。
 - 不要等待其他 agent:严格按本契约并行实现;编译期缺依赖属于预期,收口由 Lead 统一修复。
 - 有阻塞超过 30 分钟仍未解决,发消息给 lead 并附上具体错误。
+
+---
+
+## 8. [M1.5 增补] 无头 E2E 测试设施(vdesk 隐藏桌面 + 测试 RPC)
+
+> 目的:不依赖人工输入,在隐藏桌面完成 M1 交互验收(遮罩渲染/选区确认/贴图生命周期)。
+> 自动化工具:D:\Code\background-gui\publish\vdesk.exe(跨桌面枚举/PrintWindow 截图,launch 支持 --args)。
+> vdesk 无输入注入能力(红线),交互驱动一律走 OpenSnip 测试 RPC。
+
+### 8.1 Overlay 测试驱动 API(契约冻结)
+```csharp
+namespace OpenSnip.Overlay;
+public sealed class SnipOverlay {
+    // 线程安全(与 Close 同等封送机制),内部线程执行,走既有状态机(重绘/事件照常)
+    public void PostSetRegion(int x, int y, int w, int h); // 虚拟桌面物理 px,等价拖拽完成后的选区
+    public void PostConfirm();   // 等价 Enter;无选区时确认悬停窗口的既有语义保留
+    public void PostCancel();    // 等价 Esc
+}
+```
+
+### 8.2 App 测试模式(--test-rpc)
+- 启动参数 `--test-rpc`(可与 --config 并用):
+  1. **跳过单实例仲裁**(隐藏桌面实例与用户桌面实例可共存;不启动 OpenSnip.Ipc 服务端)
+  2. 创建测试命名管道 `OpenSnip.TestRpc`(JSON 单行请求 → 单行 JSON 响应)
+- 协议:
+  - `{"cmd":"status"}` → `{"ok":true,"pid":N,"tray":true,"overlay":{"active":bool,"windows":["hwnd十进制字符串"...]},"pins":[{"hwnd":"..","rect":[x,y,w,h],"topmost":bool,"opacity":N,"clickThrough":bool}]}`
+  - `{"cmd":"snip.interactive","output":{"file":"路径"}}` → 触发交互截屏(等价托盘 F1);output 可选,缺省=clipboard,语义对齐命令行 -o
+  - `{"cmd":"snip.setRegion","x":N,"y":N,"w":N,"h":N}` → 调 SnipOverlay.PostSetRegion(物理 px)
+  - `{"cmd":"snip.confirm"}` / `{"cmd":"snip.cancel"}` / `{"cmd":"pin.closeAll"}`
+  - 失败响应 `{"ok":false,"error":"..."}`;无遮罩活动时 setRegion/confirm 返回 ok:false
+- 实现:RPC 服务线程独立;触 UI 用 Dispatcher/既有封送;非测试模式零行为变化
+- hwnd 一律十进制字符串(与 vdesk JSON 约定一致,可直接 shot)
+
+### 8.3 E2E 脚本(tests/e2e/run-e2e.ps1)
+1. vdesk desktop create opensnip_e2e → launch --desktop opensnip_e2e --exe <App> --args "--test-rpc"
+2. 轮询 RPC status 直到 ok(超时 30s)
+3. snip.interactive{file:logs\e2e-snip.png} → vdesk windows 断言 OpenSnip.Overlay 窗口存在 → vdesk shot --hwnd 非黑(遮罩渲染=冻结帧+黑遮罩)
+4. snip.setRegion 200 150 800 600 → vdesk shot 二次(选区边框/锚点变化)→ snip.confirm → 断言输出文件存在且非黑
+5. 预置剪贴板位图(默认桌面写入,session 级全局)→ RPC/App paste → status 断言 pins>=1 → vdesk shot 贴图窗口非黑
+6. pin.closeAll → status pins=0 → exit → desktop destroy opensnip_e2e --kill
+7. 每步断言输出 JSON 报告;任一步失败退出码 1 并保留现场截图
+
+
+### 8.4 隐藏桌面截屏限制与测试底图注入(2026-10-31 实证裁决)
+- **实测限制**:隐藏桌面中 DXGI DuplicateOutput=E_ACCESSDENIED;BitBlt 回退在空桌面上产出"合法黑"。**遮罩在隐藏桌面拿不到有内容的冻结帧**,§8.3 的"shot 非黑=冻结帧+遮罩"断言在此环境不成立。
+- **裁决:测试底图注入(方案 C)**——`--test-rpc` 模式下,App 侧包装 SnipOverlay 的 capture 回调(**不动 Core/Overlay**):不调 ScreenCaptureService,改为按 DisplayInfo.Bounds 生成**测试底图**:8 等宽垂直色带,颜色固定表(左→右):白 FFFFFF / 黄 FFFF00 / 青 00FFFF / 绿 00FF00 / 品红 FF00FF / 红 FF0000 / 蓝 0000FF / 黑 000000。像素期望色可由 x 推导(色带=floor(x/width*8))。
+- **E2E 断言升级为像素级**:
+  1. shot1(遮罩首帧):非黑,且采样多点颜色命中色带表(证明冻结帧注入+遮罩合成路径真实工作)
+  2. setRegion(200,150,800,600) 后 shot2:选区边框(红 1px)/锚点/尺寸标签出现在期望坐标
+  3. confirm 输出文件:与源底图的选区区域逐点采样一致(证明裁剪正确)
+  4. 真实 DD 截屏内容的正确性已由 M1 实测 + 34 项单测覆盖,不在隐藏桌面重复验证
+- **单一驱动原则**:E2E 运行窗口内,只允许 e2e-dev 的脚本驱动 OpenSnip.TestRpc;其他 agent 的自测在 E2E 运行期间必须停手避让(2026-10-31 08:18 曾发生双驱动争用同一管道)。
+- **vdesk --args 语法注意**:background-gui W.cs 已支持 `--args=--test-rpc`(显式赋值,值可含 --);旧空格绕法 `--args ' --test-rpc'` 仍兼容。

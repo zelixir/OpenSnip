@@ -149,6 +149,22 @@ internal sealed class OverlaySession
         if (Phase == SnipPhase.Hover) ProbeHover(pt); // 拖拽结束恢复窗口高亮
     }
 
+    /// <summary>
+    /// 测试驱动(SPEC §8.1):等价"拖拽完成后"的选区状态——复用既有状态机字段与虚拟桌面夹取,
+    /// 置为 Selected 相位(重绘出边框/锚点/尺寸标签)。w/h 非正返回 false。
+    /// </summary>
+    public bool SetRegionExternal(PxRect r)
+    {
+        if (r.Width < 1 || r.Height < 1) return false;
+        Selection = ClampToDesktop(r);
+        Phase = SnipPhase.Selected;
+        Drag = DragKind.None;
+        _anchorIndex = -1;
+        _hits = Array.Empty<WindowInfo>(); // 清悬停层级栈;回到 Hover 时会重新探测
+        HoverRect = null;
+        return true;
+    }
+
     /// <summary>双击/回车且无选区时:把高亮窗口选为当前选区(Snipaste 行为)。</summary>
     public bool TrySelectHover()
     {

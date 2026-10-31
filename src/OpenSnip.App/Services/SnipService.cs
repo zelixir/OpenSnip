@@ -18,10 +18,13 @@ public sealed class SnipService : IDisposable
     private SnipOverlay? _activeOverlay;
     private bool _busy;
 
-    public SnipService(StaWorker sta, OutputRunner outputs)
+    private readonly bool _testMode;            // §8.4:--test-rpc 底图注入开关
+
+    public SnipService(StaWorker sta, OutputRunner outputs, bool testMode = false)
     {
         _sta = sta;
         _outputs = outputs;
+        _testMode = testMode;
     }
 
     // —— 交互式截屏(F1 / 托盘 / CLI snip)——
@@ -60,14 +63,9 @@ public sealed class SnipService : IDisposable
             {
                 return (false, "未枚举到任何显示器");
             }
-            var capture = EnsureCapture();
+            var capture = _testMode ? null : EnsureCapture(); // §8.4:底图注入时不创建截屏服务
 
-            var overlay = new SnipOverlay(displays, display =>
-            {
-                var bmp = capture.Capture(display); // DXGI 失败自动回退 BitBlt(§2.3)
-                PerfLog.Log("App", $"snip:freeze display={display.Index} {bmp.Width}x{bmp.Height} mode={capture.LastUsedMode} t={AppClock.ElapsedMs}ms");
-                return bmp;
-            });
+            var overlay = new SnipOverlay(displays, display => CaptureForSnip(capture, display));
 
             var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             overlay.Confirmed += result =>
@@ -141,7 +139,7 @@ public sealed class SnipService : IDisposable
             {
                 return (false, "未枚举到任何显示器");
             }
-            var capture = EnsureCapture();
+            var capture = _testMode ? null : EnsureCapture();
 
             DisplayInfo display;
             if (mode == SnipMode.Full)
@@ -157,9 +155,9 @@ public sealed class SnipService : IDisposable
             }
 
             var swCapture = Stopwatch.StartNew();
-            var shot = capture.Capture(display);
+            var shot = CaptureForSnip(capture, display);
             swCapture.Stop();
-            PerfLog.Log("App", $"snip:direct-capture display={display.Index}({display.DeviceName}) mode={capture.LastUsedMode} {swCapture.Elapsed.TotalMilliseconds:F1}ms");
+            PerfLog.Log("App", $"snip:direct-capture display={display.Index}({display.DeviceName}) {swCapture.Elapsed.TotalMilliseconds:F1}ms");
 
             NativeBitmap image;
             PxRect outRect;
@@ -209,6 +207,24 @@ public sealed class SnipService : IDisposable
         }
     }
 
+    /// <summary>
+    /// 冻结画面统一入口:测试模式返回 §8.4 的 8 色带合成底图(隐藏桌面 DD/BitBlt 均不可用,实测裁决),
+    /// 正常模式走 ScreenCaptureService(DXGI 失败自动回退 BitBlt,§2.3)。
+    /// 恢复测试模式真实截屏(如在可见测试桌面对拍):构造 SnipService 传 testMode:false 即可。
+    /// </summary>
+    private NativeBitmap CaptureForSnip(ScreenCaptureService? capture, DisplayInfo display)
+    {
+        if (_testMode)
+        {
+            var pattern = TestBaseImage.Create(display.Bounds);
+            PerfLog.Log("App", $"snip:freeze TEST-PATTERN(§8.4 底图注入) display={display.Index} {pattern.Width}x{pattern.Height} bands=8 t={AppClock.ElapsedMs}ms");
+            return pattern;
+        }
+        var bmp = capture!.Capture(display); // DXGI 失败自动回退 BitBlt(§2.3)
+        PerfLog.Log("App", $"snip:freeze display={display.Index} {bmp.Width}x{bmp.Height} mode={capture.LastUsedMode} t={AppClock.ElapsedMs}ms");
+        return bmp;
+    }
+
     /// <summary>物理像素矩形求交(不相交返回 PxRect.Empty)。</summary>
     private static PxRect Intersect(PxRect a, PxRect b)
     {
@@ -225,6 +241,15 @@ public sealed class SnipService : IDisposable
         lock (_gate)
         {
             return _capture ??= new ScreenCaptureService();
+        }
+    }
+
+    /// <summary>当前活动遮罩(§8.2 测试 RPC 驱动用);无活动返回 null。Post* 调用由 Overlay 内部封送。</summary>
+    internal SnipOverlay? TryGetActiveOverlay()
+    {
+        lock (_gate)
+        {
+            return _activeOverlay;
         }
     }
 

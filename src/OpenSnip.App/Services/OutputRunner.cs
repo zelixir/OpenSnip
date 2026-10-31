@@ -14,8 +14,13 @@ namespace OpenSnip.App.Services;
 public sealed class OutputRunner
 {
     private readonly StaWorker _sta;
+    private readonly PinRegistry _pins;
 
-    public OutputRunner(StaWorker sta) => _sta = sta;
+    public OutputRunner(StaWorker sta, PinRegistry pins)
+    {
+        _sta = sta;
+        _pins = pins;
+    }
 
     /// <summary>执行全部输出;返回 pin 是否接管了位图(接管 ⇒ 调用方不得再 Dispose)。</summary>
     public bool Run(NativeBitmap image, PxRect sourceRect, IReadOnlyList<OutputTarget> targets)
@@ -46,7 +51,7 @@ public sealed class OutputRunner
             var rect = sourceRect.IsEmpty
                 ? PasteService.CenterIn(PasteService.GetPrimaryWorkArea(), image.Width, image.Height)
                 : sourceRect;
-            PinManager.Pin(image, rect); // 所有权转移:PinWindow Close 时 Dispose(§2.9)
+            _pins.Track(PinManager.Pin(image, rect)); // 所有权转移:PinWindow Close 时 Dispose(§2.9);登记供 §8.2 status
             pinTaken = true;
             PerfLog.Log("App", $"output:pin rect={rect.X},{rect.Y} {rect.Width}x{rect.Height} {sw.Elapsed.TotalMilliseconds:F1}ms");
         }

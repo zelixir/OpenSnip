@@ -37,29 +37,37 @@ public partial class App : Application
             return;
         }
 
-        // —— 第二实例路径:完整命令行转发给首实例(§3.4)——
-        var relay = await IpcClient.RelayAsync(args, options.Block);
-        if (relay.Connected)
+        // —— 测试模式(§8.2):跳过单实例仲裁,可与用户桌面实例共存;不启动 OpenSnip.Ipc ——
+        if (options.TestRpc)
         {
-            PerfLog.Log("App", $"ipc:relayed-to-first-instance block={options.Block} status={relay.Status} ok={relay.Ok} msg={relay.Message}");
-            if (options.Block)
-            {
-                Console.WriteLine(relay.Ok ? "[OpenSnip] OK" : $"[OpenSnip] ERR {relay.Message}");
-            }
-            Shutdown(relay.ExitCode);
-            return;
+            PerfLog.Log("App", "test-rpc:mode-enter(跳过单实例仲裁)");
         }
-
-        // —— 首实例路径 ——
-        if (options.Command == CliCommandKind.Exit)
+        else
         {
-            PerfLog.Log("App", "exit:no-running-instance(没有已运行实例,直接退出)");
-            Shutdown(0);
-            return;
+            // —— 第二实例路径:完整命令行转发给首实例(§3.4)——
+            var relay = await IpcClient.RelayAsync(args, options.Block);
+            if (relay.Connected)
+            {
+                PerfLog.Log("App", $"ipc:relayed-to-first-instance block={options.Block} status={relay.Status} ok={relay.Ok} msg={relay.Message}");
+                if (options.Block)
+                {
+                    Console.WriteLine(relay.Ok ? "[OpenSnip] OK" : $"[OpenSnip] ERR {relay.Message}");
+                }
+                Shutdown(relay.ExitCode);
+                return;
+            }
+
+            // —— 首实例路径 ——
+            if (options.Command == CliCommandKind.Exit)
+            {
+                PerfLog.Log("App", "exit:no-running-instance(没有已运行实例,直接退出)");
+                Shutdown(0);
+                return;
+            }
         }
 
         PerfLog.Log("App", $"startup:begin process-ms={Environment.TickCount64 - StartTickCount} args=[{string.Join(' ', args)}]");
-        _orchestrator = new AppOrchestrator();
+        _orchestrator = new AppOrchestrator(testMode: options.TestRpc);
         try
         {
             await _orchestrator.InitializeAsync();

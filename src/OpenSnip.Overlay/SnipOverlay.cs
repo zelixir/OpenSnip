@@ -70,6 +70,37 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         // 窗口尚未创建时:线程建窗循环与消息循环入口都会检查 _closeRequested
     }
 
+    // —————————————————— §8.1 测试驱动(vdesk 无头 E2E)——————————————————
+    // 与 Close() 相同的封送机制:PostMessage 到内部 UI 线程,由 HandleMessage 在
+    // 既有状态机上执行并照常重绘/触发事件。遮罩未激活(窗口未建/已退出)时为 no-op。
+    // 64 位打包:x,y → wParam 低/高 32 位;w,h → lParam 低/高 32 位(负坐标位模式无损)。
+
+    /// <summary>线程安全:设置选区(虚拟桌面物理 px),等价一次拖拽完成。走既有选区状态机。</summary>
+    public void PostSetRegion(int x, int y, int w, int h)
+    {
+        long hwnd = Interlocked.Read(ref _firstHwnd);
+        if (hwnd == 0) return;
+        IntPtr wParam = new IntPtr((uint)x | ((long)(uint)y << 32));
+        IntPtr lParam = new IntPtr((uint)w | ((long)(uint)h << 32));
+        NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_SETREGION, wParam, lParam);
+    }
+
+    /// <summary>线程安全:等价 Enter。无选区时确认悬停窗口的既有语义保留。</summary>
+    public void PostConfirm()
+    {
+        long hwnd = Interlocked.Read(ref _firstHwnd);
+        if (hwnd == 0) return;
+        NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_CONFIRM, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// <summary>线程安全:等价 Esc(Cancelled 事件照常在内部线程触发)。</summary>
+    public void PostCancel()
+    {
+        long hwnd = Interlocked.Read(ref _firstHwnd);
+        if (hwnd == 0) return;
+        NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_CANCEL, IntPtr.Zero, IntPtr.Zero);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -276,6 +307,28 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                 case WM.MOUSEWHEEL:
                     if (_session?.OnWheel((short)((long)wParam >> 16)) == true)
                         RenderAll();
+                    return true;
+
+                case WM.APP_SETREGION: // §8.1 测试驱动
+                {
+                    int sx = (int)(long)wParam;
+                    int sy = (int)((long)wParam >> 32);
+                    int sw = (int)(long)lParam;
+                    int sh = (int)((long)lParam >> 32);
+                    if (_session?.SetRegionExternal(new PxRect(sx, sy, sw, sh)) == true)
+                        RenderAll(); // 重绘出选区边框/锚点/尺寸标签(vdesk PrintWindow 可见)
+                    return true;
+                }
+
+                case WM.APP_CONFIRM: // §8.1:与 VK_RETURN / 双击完全同分支
+                {
+                    if (_session is { } sc && sc.Selection is null && !sc.TrySelectHover()) return true;
+                    ConfirmAndExit();
+                    return true;
+                }
+
+                case WM.APP_CANCEL: // §8.1:与 VK_ESCAPE 完全同分支
+                    NativeMethods.PostQuitMessage(0);
                     return true;
 
                 case WM.KEYDOWN:

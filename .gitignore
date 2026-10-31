@@ -9,3 +9,7 @@ logs/*.png
 logs/*.log
 # NuGet
 packages/
+
+# E2E 运行产物(不入库)
+tests/e2e/artifacts/
+tests/e2e/report/

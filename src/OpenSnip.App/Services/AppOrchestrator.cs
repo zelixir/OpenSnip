@@ -20,16 +20,27 @@ public sealed class AppOrchestrator : IDisposable
     private readonly PasteService _paste;
     private readonly TrayService _tray = new();
     private readonly IpcServer _ipc;
+    private readonly PinRegistry _pins = new();
+    private readonly TestRpcService _testRpc;
+    private readonly bool _testMode;   // §8.2/§8.4:--test-rpc 测试模式
     private GlobalHotkeyManager? _hotkeys;
     private bool _exiting;
 
-    public AppOrchestrator()
+    public AppOrchestrator(bool testMode = false)
     {
+        _testMode = testMode;
         _uiDispatcher = Dispatcher.CurrentDispatcher;   // OnStartup 在 UI 线程 new 本类
-        _outputs = new OutputRunner(_sta);
-        _snip = new SnipService(_sta, _outputs);
-        _paste = new PasteService(_sta);
+        _outputs = new OutputRunner(_sta, _pins);
+        _snip = new SnipService(_sta, _outputs, testMode);
+        _paste = new PasteService(_sta, _pins);
         _ipc = new IpcServer(HandleIpcCommandAsync);
+        // §8.2 测试 RPC:snip.interactive / 遮罩驱动 / pins / tray 状态源 / paste(仅 --test-rpc 模式 Start)
+        _testRpc = new TestRpcService(
+            targets => _snip.StartInteractiveAsync("test-rpc", targets),
+            () => _snip.TryGetActiveOverlay(),
+            _pins,
+            () => _tray.IsReady,
+            () => _paste.PinFromClipboard("test-rpc"));
     }
 
     /// <summary>装配托盘/热键/IPC/预热(UI 线程调用)。PerfLog:进程启动→托盘就绪全链路。</summary>
@@ -40,7 +51,7 @@ public sealed class AppOrchestrator : IDisposable
         _tray.SnipRequested += () => _ = StartInteractiveSafe("tray");
         _tray.PasteRequested += () => Task.Run(() => _paste.PinFromClipboard("tray"));
         _tray.ExitRequested += () => RequestExit("tray");
-        _tray.Initialize();
+        _tray.Initialize(suppressErrors: _testMode); // 测试模式(隐藏桌面可能无任务栏)容忍托盘创建失败
 
         _hotkeys = new GlobalHotkeyManager();
         // F1=VK_F1(0x70)截屏,F3=VK_F3(0x72)贴图;无修饰键。事件在热键线程触发 ⇒ 订阅内自行调度
@@ -55,11 +66,29 @@ public sealed class AppOrchestrator : IDisposable
             }
         };
 
-        _ipc.Start();
+        if (_testMode)
+        {
+            // §8.2:--test-rpc 不启动 OpenSnip.Ipc(可与用户桌面实例共存),改开测试管道
+            _testRpc.Start();
+            PerfLog.Log("App", $"startup:test-rpc-listening pipe={TestRpcService.PipeName} init={sw.Elapsed.TotalMilliseconds:F1}ms");
+        }
+        else
+        {
+            _ipc.Start();
+            PerfLog.Log("App", $"startup:ipc-listening pipe={IpcProtocol.PipeName} init={sw.Elapsed.TotalMilliseconds:F1}ms");
+        }
 
-        new WarmupService(() => _snip.EnsureCapture()).Schedule(3000); // §3.4:启动 3s 后预热
+        if (_testMode)
+        {
+            // §8.4:底图注入模式不创建截屏服务,预热无意义(隐藏桌面 DD 也不可用)
+            PerfLog.Log("App", "warmup:skipped(test-rpc 底图注入模式)");
+        }
+        else
+        {
+            new WarmupService(() => _snip.EnsureCapture()).Schedule(3000); // §3.4:启动 3s 后预热
+        }
 
-        PerfLog.Log("App", $"startup:ready(托盘/热键/IPC/预热已安排) init={sw.Elapsed.TotalMilliseconds:F1}ms f1={f1} f3={f3} process-ms={AppClock.ElapsedMs}");
+        PerfLog.Log("App", $"startup:ready(托盘/热键/IPC·TestRpc/预热已安排) init={sw.Elapsed.TotalMilliseconds:F1}ms f1={f1} f3={f3} test={_testMode} process-ms={AppClock.ElapsedMs}");
         return Task.CompletedTask;
     }
 
@@ -125,6 +154,7 @@ public sealed class AppOrchestrator : IDisposable
         try { _hotkeys?.Dispose(); } catch { /* 已释放 */ }
         try { _tray.Dispose(); } catch { /* 已释放 */ }
         _ = _ipc.DisposeAsync();
+        _ = _testRpc.DisposeAsync();
 
         _uiDispatcher.BeginInvoke(() =>
         {
@@ -139,6 +169,7 @@ public sealed class AppOrchestrator : IDisposable
         try { _hotkeys?.Dispose(); } catch { /* 已释放 */ }
         try { _tray.Dispose(); } catch { /* 已释放 */ }
         try { _ipc.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); } catch { /* 退出路径 */ }
+        try { _testRpc.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); } catch { /* 退出路径 */ }
         _sta.Dispose();
     }
 }

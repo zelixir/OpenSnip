@@ -11,8 +11,13 @@ namespace OpenSnip.App.Services;
 public sealed class PasteService
 {
     private readonly StaWorker _sta;
+    private readonly PinRegistry _pins;
 
-    public PasteService(StaWorker sta) => _sta = sta;
+    public PasteService(StaWorker sta, PinRegistry pins)
+    {
+        _sta = sta;
+        _pins = pins;
+    }
 
     public (bool Ok, string? Error) PinFromClipboard(string trigger)
     {
@@ -31,7 +36,7 @@ public sealed class PasteService
         foreach (var bmp in images)
         {
             var rect = CenterIn(area, bmp.Width, bmp.Height, cascade);
-            PinManager.Pin(bmp, rect); // 所有权转移:PinWindow Close 时 Dispose(§2.9)
+            _pins.Track(PinManager.Pin(bmp, rect)); // 所有权转移(§2.9);登记供 §8.2 status
             PerfLog.Log("App", $"paste:pin rect={rect.X},{rect.Y} {rect.Width}x{rect.Height}");
             cascade++;
         }

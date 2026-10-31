@@ -21,7 +21,29 @@ public sealed class TrayService : IDisposable
     /// <summary>退出请求(菜单项)。</summary>
     public event Action? ExitRequested;
 
-    public void Initialize()
+    /// <summary>托盘图标是否创建成功(§8.2 status.tray)。</summary>
+    public bool IsReady { get; private set; }
+
+    /// <summary>
+    /// 初始化托盘。suppressErrors=true(--test-rpc 隐藏桌面可能无 Explorer/任务栏):失败降级为
+    /// IsReady=false 并打日志;非测试模式保持原语义(异常向上抛,由 OnStartup 兜底)。
+    /// </summary>
+    public void Initialize(bool suppressErrors = false)
+    {
+        try
+        {
+            InitializeCore();
+            IsReady = true;
+            PerfLog.Log("App", "tray:ready");
+        }
+        catch (Exception ex) when (suppressErrors)
+        {
+            IsReady = false;
+            PerfLog.Log("App", $"tray:init-failed(测试模式容忍) {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void InitializeCore()
     {
         var menu = new ContextMenu();
         var snipItem = new MenuItem { Header = "截屏 (F1)" };
@@ -45,7 +67,6 @@ public sealed class TrayService : IDisposable
         icon.TrayLeftMouseDoubleClick += (_, _) => SnipRequested?.Invoke();
         _icon = icon;
         TryForceCreate(icon); // 纯代码创建且无宿主窗口:显式创建,不依赖 Loaded 事件
-        PerfLog.Log("App", "tray:ready");
     }
 
     private static ImageSource? CreateIconSource()
