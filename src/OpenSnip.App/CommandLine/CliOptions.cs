@@ -2,8 +2,8 @@ using System.Globalization;
 
 namespace OpenSnip.App.CommandLine;
 
-/// <summary>顶层命令(SPEC §3.4:snip / paste / exit;§12:history)。</summary>
-public enum CliCommandKind { None, Snip, Paste, Exit, History }
+/// <summary>顶层命令(SPEC §3.4:snip / paste / exit;§12:history;§15:whiteboard)。</summary>
+public enum CliCommandKind { None, Snip, Paste, Exit, History, Whiteboard }
 
 /// <summary>snip 的取图方式:交互遮罩 / 全屏直截 / 指定矩形直截。</summary>
 public enum SnipMode { Interactive, Full, Area }
@@ -25,12 +25,14 @@ public sealed record CliOptions(
     int AreaX, int AreaY, int AreaW, int AreaH,
     double DelaySeconds,
     int HistoryCount,
+    int WhiteboardColorArgb,
+    bool ActiveScreen,
     IReadOnlyList<OutputTarget> Outputs,
     bool HasExplicitOutputs)
 {
     public static CliOptions Fail(string error) => new(
         Ok: false, Error: error, Block: false, TestRpc: false, CliCommandKind.None, SnipMode.Interactive,
-        0, 0, 0, 0, 0, 10, Array.Empty<OutputTarget>(), HasExplicitOutputs: false);
+        0, 0, 0, 0, 0, 10, -1, false, Array.Empty<OutputTarget>(), HasExplicitOutputs: false);
 }
 
 /// <summary>
@@ -68,6 +70,8 @@ public static class CommandLineParser
             bool block = false;
             bool testRpc = false;
             int historyCount = 10; // §12:history [N] 默认 10
+            int wbColor = -1;      // §15:whiteboard --color(#RRGGBB);-1=默认白
+            bool activeScreen = false; // §15:whiteboard --active-screen
 
             for (int i = 0; i < args.Count; i++)
             {
@@ -95,6 +99,23 @@ public static class CommandLineParser
                     case "exit":
                         if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
                         command = CliCommandKind.Exit;
+                        break;
+                    case "whiteboard": // §15:白板模式
+                        if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
+                        command = CliCommandKind.Whiteboard;
+                        break;
+                    case "--color": // §15:--color #RRGGBB(白板底色)
+                    {
+                        if (command != CliCommandKind.Whiteboard) return CliOptions.Fail("--color 只用于 whiteboard");
+                        if (i + 1 >= args.Count) return CliOptions.Fail("--color 需要 #RRGGBB");
+                        if (!TryParseColor(args[i + 1], out var argb)) return CliOptions.Fail($"--color 颜色格式非法(需 #RRGGBB):{args[i + 1]}");
+                        wbColor = argb;
+                        i += 1;
+                        break;
+                    }
+                    case "--active-screen": // §15:仅当前活动屏
+                        if (command != CliCommandKind.Whiteboard) return CliOptions.Fail("--active-screen 只用于 whiteboard");
+                        activeScreen = true;
                         break;
                     case "history": // §12:history [N] — 列出最近 N 条历史(默认 10)
                         if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
@@ -155,7 +176,7 @@ public static class CommandLineParser
                         return CliOptions.Fail(tok.StartsWith('-') ? $"未知选项:{tok}" : $"无法识别的参数:{tok}");
                 }
             }
-            return new CliOptions(true, null, block, testRpc, command, mode, ax, ay, aw, ah, delay, historyCount, outputs, explicitOutputs);
+            return new CliOptions(true, null, block, testRpc, command, mode, ax, ay, aw, ah, delay, historyCount, wbColor, activeScreen, outputs, explicitOutputs);
         }
         catch (Exception ex)
         {
@@ -169,6 +190,17 @@ public static class CommandLineParser
             : current == CliCommandKind.None
                 ? $"选项 {token} 需要先给出命令 snip(例:OpenSnip.App snip --full)"
                 : $"选项 {token} 只用于 snip 命令";
+
+    /// <summary>解析 #RRGGBB / RRGGBB → 0xFFrrggbb(白板底色,alpha 恒 255)。</summary>
+    private static bool TryParseColor(string s, out int argb)
+    {
+        argb = -1;
+        var hex = s.StartsWith('#') ? s[1..] : s;
+        if (hex.Length != 6) return false;
+        if (!int.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rgb)) return false;
+        argb = unchecked((int)0xFF000000u) | rgb;
+        return true;
+    }
 
     private static bool TryParseInt(string s, out int v)
         => int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v);

@@ -24,6 +24,13 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
 
     private OverlaySession? _session;
     private readonly IReadOnlyList<NativeBitmap>? _historyFrames; // §9 回放:历史帧(App 拥有,Overlay 不 Dispose)
+    private readonly Func<PxPoint, IReadOnlyList<ElementInfo>>? _elementHitTest; // §13 元素命中注入
+
+    /// <summary>
+    /// §15 白板模式(internal,WhiteboardSession 组装用):纯色"冻结帧" + 无遮罩/无选区 UI/无高亮,
+    /// 标注全开;确认 = 主屏全幅 + 标注合成(Selected 相位恒全屏,工具条照常)。
+    /// </summary>
+    internal bool WhiteboardMode { get; set; }
     private int _frameIndex;                                      // 0 = 当前 capture 帧
     private Thread? _thread;
     private volatile bool _closeRequested;
@@ -49,10 +56,22 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
     /// </summary>
     public SnipOverlay(IReadOnlyList<DisplayInfo> displays, Func<DisplayInfo, NativeBitmap> capture,
         IReadOnlyList<NativeBitmap>? historyFrames)
+        : this(displays, capture, historyFrames, null)
+    {
+    }
+
+    /// <summary>
+    /// §13 元素检测消费:elementHitTest 注入命中函数(通常 = ElementDetector.HitTest 的方法组;
+    /// 缺省 null = 无元素模式,Tab 不切换)。注入方自带 100ms 超时语义,空响应按软处理。
+    /// </summary>
+    public SnipOverlay(IReadOnlyList<DisplayInfo> displays, Func<DisplayInfo, NativeBitmap> capture,
+        IReadOnlyList<NativeBitmap>? historyFrames,
+        Func<PxPoint, IReadOnlyList<ElementInfo>>? elementHitTest)
     {
         _displays = displays ?? throw new ArgumentNullException(nameof(displays));
         _capture = capture ?? throw new ArgumentNullException(nameof(capture));
         _historyFrames = historyFrames;
+        _elementHitTest = elementHitTest;
         if (_displays.Count == 0) throw new ArgumentException("displays 不能为空", nameof(displays));
     }
 
@@ -119,6 +138,17 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         long hwnd = Interlocked.Read(ref _firstHwnd);
         if (hwnd == 0) return;
         NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_CANCEL, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// §19:线程安全切回放帧(与 PostSetRegion 同封送机制;App 的 snip.setFrame 直调)。
+    /// index 语义与逗号/句号一致:0 = 本次 capture 帧;1..n = historyFrames 展平帧;越界静默 no-op。
+    /// </summary>
+    public void PostSetFrame(int index)
+    {
+        long hwnd = Interlocked.Read(ref _firstHwnd);
+        if (hwnd == 0) return;
+        NativeMethods.PostMessageW(new IntPtr(hwnd), WM.APP_SETFRAME, new IntPtr(index), IntPtr.Zero);
     }
 
     /// <summary>
@@ -201,7 +231,19 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
             if (_closeRequested && _windows.Count == 0) return;
 
             _session = new OverlaySession(_displays, _frozen, _selfHwnds,
-                d => _windows.Find(w => w.Display.Index == d.Index)?.FrozenImage);
+                d => _windows.Find(w => w.Display.Index == d.Index)?.FrozenImage,
+                _elementHitTest);
+            if (WhiteboardMode)
+                _session.EnterWhiteboard(); // §15:恒 Selected 相位(选区=虚拟桌面全幅),标注/工具条立即可用
+
+            // §14 文本编辑光标闪烁:500ms Win32 Timer(挂首窗,WM_TIMER 重绘)
+            _session.Annot.CaretTimerRequested += running =>
+            {
+                var h = _windows.Count > 0 ? _windows[0].Handle : IntPtr.Zero;
+                if (h == IntPtr.Zero) return;
+                if (running) NativeMethods.SetTimer(h, new IntPtr(1), 400, IntPtr.Zero);
+                else NativeMethods.KillTimer(h, new IntPtr(1));
+            };
             // §9 工具条按钮:确认/取消(等价 Enter/Esc)
             _session.Annot.ConfirmRequested += () => ConfirmAndExit();
             _session.Annot.CancelRequested += () => NativeMethods.PostQuitMessage(0);
@@ -398,6 +440,10 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                     NativeMethods.PostQuitMessage(0);
                     return true;
 
+                case WM.APP_SETFRAME: // §19:切回放帧(越界在 SwitchFrameTo 内静默 no-op)
+                    SwitchFrameTo((int)(long)wParam);
+                    return true;
+
                 case WM.APP_SNAPSHOT: // §8.5 测试驱动:进程内导出渲染 DIB(wParam=cookie)
                 {
                     int cookie = unchecked((int)(long)wParam);
@@ -419,6 +465,23 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                     }
                     return true;
                 }
+
+                case WM.CHAR: // §14 文本键入(含 IME 合成结果;回车在 VK_RETURN 分支处理)
+                {
+                    char ch = (char)(long)wParam;
+                    if (ch == '\r' || ch == '\n') return true;
+                    if (_session?.Annot.HandleChar(ch) == true)
+                        RenderAll();
+                    return true;
+                }
+
+                case WM.TIMER: // §14 光标闪烁
+                    if (wParam.ToInt64() == 1)
+                    {
+                        if (_session?.Annot.IsTextEditing == true) RenderAll();
+                        return true;
+                    }
+                    return false;
 
                 case WM.KEYDOWN:
                 case WM.SYSKEYDOWN:
@@ -448,6 +511,14 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
             return;
         }
 
+        // §13 Tab:窗口/元素检测模式切换(未注入元素检测时切换失败静默)
+        if (vk == 0x09 && sess?.Annot.IsTextEditing != true)
+        {
+            sess?.ToggleHitMode();
+            RenderAll();
+            return;
+        }
+
         // §9 回放:逗号/句号循环切换冻结帧
         if (vk == Win32.VK_OEM_COMMA) { SwitchFrame(-1); return; }
         if (vk == Win32.VK_OEM_PERIOD) { SwitchFrame(1); return; }
@@ -458,6 +529,12 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                 NativeMethods.PostQuitMessage(0);
                 return;
             case Win32.VK_RETURN:
+                // §14:文本编辑态 Enter=提交 / Shift+Enter=换行
+                if (_session is { } st && st.Annot.IsTextEditing)
+                {
+                    if (st.Annot.HandleTextEnterKey(shift)) RenderAll();
+                    return;
+                }
                 if (_session is { } s && s.Selection is null && !s.TrySelectHover()) return;
                 ConfirmAndExit();
                 return;
@@ -486,7 +563,18 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         if (frames is not { Count: > 0 }) return;
         int perFrame = Math.Max(1, _displays.Count);
         int total = 1 + (frames.Count + perFrame - 1) / perFrame;
-        _frameIndex = ((_frameIndex + dir) % total + total) % total;
+        SwitchFrameTo(((_frameIndex + dir) % total + total) % total);
+    }
+
+    /// <summary>切到绝对帧索引(0=capture;越界静默 no-op;同帧幂等)。§19 PostSetFrame 后端。</summary>
+    private void SwitchFrameTo(int index)
+    {
+        var frames = _historyFrames;
+        if (frames is not { Count: > 0 }) return;
+        int perFrame = Math.Max(1, _displays.Count);
+        int total = 1 + (frames.Count + perFrame - 1) / perFrame;
+        if (index < 0 || index >= total || index == _frameIndex) return;
+        _frameIndex = index;
         foreach (var w in _windows)
         {
             try
@@ -524,12 +612,29 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
         if (s is null || _confirmed) return;
 
         SnipResult? result = null;
-        var elapsed = PerfLog.Measure("Overlay.Confirm", "crop", () => result = s.BuildResult());
-        if (result is null) return; // 无有效选区
+        if (WhiteboardMode)
+        {
+            // §15:白板确认 = 主屏全幅 + 标注合成(无选区裁剪)
+            var primary = _displays.FirstOrDefault(d => d.IsPrimary) ?? _displays[0];
+            var elapsedWb = PerfLog.Measure("Whiteboard.Confirm", "export", () => result = s.BuildWhiteboardResult(primary));
+            if (result is null)
+            {
+                PerfLog.Log("Whiteboard.Confirm", "export FAILED (无冻结帧?)");
+                return;
+            }
+            PerfLog.Log("Whiteboard.Confirm",
+                $"export done in {elapsedWb.TotalMilliseconds:F1}ms {result.PhysicalRect.Width}x{result.PhysicalRect.Height}");
+        }
+        else
+        {
+            var elapsed = PerfLog.Measure("Overlay.Confirm", "crop", () => result = s.BuildResult());
+            if (result is null) return; // 无有效选区
+            PerfLog.Log("Overlay.Confirm", $"crop done in {elapsed.TotalMilliseconds:F1}ms");
+        }
 
         _confirmed = true;
         PerfLog.Log("Overlay.Confirm",
-            $"crop done in {elapsed.TotalMilliseconds:F1}ms rect={result.PhysicalRect.X},{result.PhysicalRect.Y} " +
+            $"rect={result.PhysicalRect.X},{result.PhysicalRect.Y} " +
             $"{result.PhysicalRect.Width}x{result.PhysicalRect.Height} display={result.Display.Index}");
 
         // 先隐藏再触发:App 在事件里做剪贴板/Pin 时屏幕已恢复

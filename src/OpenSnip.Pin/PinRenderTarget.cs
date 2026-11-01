@@ -104,8 +104,10 @@ internal sealed class PinRenderTarget : IDisposable
     /// 传入时窗口整体不透明(alpha=255 整块可命中);null 时保持 M1 逐像素 alpha 行为。
     /// opacityPercent ∈ [10,100]:以颜色矩阵把内容层预乘像素整体按比例衰减(与 LWA_ALPHA 等价;
     /// 不作用于背景层 —— 伪透明下"背景恒清晰、内容随透明度淡出",符合直觉)。
+    /// cropSelection(契约 §18 裁剪态):窗口内客户区选框(物理 px);非空时选框外画 50% 黑遮罩
+    /// 并加 1px 红选框,空矩形(SKRectI.Empty)表示未选=全窗遮罩;null 表示非裁剪态。
     /// </summary>
-    public unsafe bool Commit(IntPtr hwnd, int x, int y, SKBitmap content, byte opacityPercent, SKBitmap? background = null)
+    public unsafe bool Commit(IntPtr hwnd, int x, int y, SKBitmap content, byte opacityPercent, SKBitmap? background = null, SKRectI? cropSelection = null)
     {
         EnsureSize(content.Width, content.Height);
         if (_skiaWrapper is null)
@@ -127,6 +129,25 @@ internal sealed class PinRenderTarget : IDisposable
                 paint.ColorFilter = filter;
             }
             canvas.DrawBitmap(content, 0f, 0f, SKSamplingOptions.Default, paint);
+
+            // 裁剪态(契约 §18):选框外 50% 黑遮罩 + 1px 红选框;未选时全窗遮罩
+            if (cropSelection is SKRectI sel)
+            {
+                using var mask = new SKPaint { Color = new SKColor(0, 0, 0, 128) };
+                if (!sel.IsEmpty)
+                {
+                    canvas.DrawRect(0, 0, _width, Math.Max(0, sel.Top), mask);
+                    canvas.DrawRect(0, sel.Bottom, _width, Math.Max(0, _height - sel.Bottom), mask);
+                    canvas.DrawRect(0, sel.Top, Math.Max(0, sel.Left), Math.Max(0, sel.Height), mask);
+                    canvas.DrawRect(sel.Right, sel.Top, Math.Max(0, _width - sel.Right), Math.Max(0, sel.Height), mask);
+                    using var border = new SKPaint { Color = SKColors.Red, Style = SKPaintStyle.Stroke, StrokeWidth = 1 };
+                    canvas.DrawRect(sel.Left, sel.Top, sel.Width, sel.Height, border);
+                }
+                else
+                {
+                    canvas.DrawRect(0, 0, _width, _height, mask);
+                }
+            }
             canvas.Flush();
         }
 

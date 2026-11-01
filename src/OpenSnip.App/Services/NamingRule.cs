@@ -10,8 +10,8 @@ namespace OpenSnip.App.Services;
 /// </summary>
 public static partial class NamingRule
 {
-    /// <summary>默认模板(SPEC §12 默认名 Snip_日期_时间 的模板化表达)。</summary>
-    public const string DefaultTemplate = "Snip_$yyyy$-$MM$-$dd$_$HH$-$mm$-$ss";
+    /// <summary>默认模板(§12 默认名 Snip_日期_时间 的模板化表达;SPEC 原文尾部 $ss 缺闭合符,按 9 变量语法修正)。</summary>
+    public const string DefaultTemplate = "Snip_$yyyy$-$MM$-$dd$_$HH$-$mm$-$ss$";
 
     /// <summary>历史存档固定文件名主体(§12:Snip_yyyyMMdd_HHmmss_fff.png)。</summary>
     public static string HistoryBaseName(DateTime now) => "Snip_" + now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);

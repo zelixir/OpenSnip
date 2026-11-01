@@ -13,6 +13,8 @@ internal static class WM
     public const uint ERASEBKGND = 0x0014;
     public const uint SETCURSOR = 0x0020;
     public const uint KEYDOWN = 0x0100;
+    public const uint CHAR = 0x0102;
+    public const uint TIMER = 0x0113;
     public const uint SYSKEYDOWN = 0x0104;
     public const uint MOUSEMOVE = 0x0200;
     public const uint LBUTTONDOWN = 0x0201;
@@ -25,6 +27,7 @@ internal static class WM
     public const uint APP_SETREGION = 0x8001;
     public const uint APP_CONFIRM = 0x8002;
     public const uint APP_CANCEL = 0x8003;
+    public const uint APP_SETFRAME = 0x8005; // §19:切回放帧(wParam = 帧索引,0=capture;0x8004 已被 APP_SNAPSHOT 占用)
     public const uint APP_SNAPSHOT = 0x8004; // §8.5:渲染 DIB 进程内导出(wParam=cookie)
 }
 
@@ -217,6 +220,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     internal static extern short GetKeyState(int nVirtKey);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern IntPtr SetTimer(IntPtr hWnd, IntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool KillTimer(IntPtr hWnd, IntPtr uIDEvent);
 
     // —— ULW ——
     [DllImport("user32.dll", SetLastError = true)]

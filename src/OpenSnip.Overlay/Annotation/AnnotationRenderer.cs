@@ -13,18 +13,76 @@ internal static class AnnotationRenderer
     private const float MosaicBlock = 16f;
     private const float BlurSigma = 8f;
 
+    private static readonly SKTypeface UiTypeface = SKTypeface.FromFamilyName("Segoe UI") ?? SKTypeface.Default;
+
+    /// <summary>
+    /// 文本度量(§14:ReflowText 增长文本框用)。多行以 \n 分隔;返回 (宽, 高) 逻辑 px(fontSize 已含 DPI)。
+    /// </summary>
+    public static (float Width, float Height) MeasureText(string text, float fontSize)
+    {
+        using var font = new SKFont(UiTypeface, fontSize);
+        float maxW = 0;
+        int lines = 1;
+        foreach (var line in text.Split('\n'))
+        {
+            if (line.Length > 0) maxW = MathF.Max(maxW, font.MeasureText(line));
+            lines++;
+        }
+        var m = font.Metrics;
+        float lineH = m.Descent - m.Ascent;
+        return (maxW, lineH * lines);
+    }
+
     /// <summary>绘制全部标注 + 选中态。shapes 为桌面坐标;frozen 为本屏冻结画面(窗口本地原点 origin)。</summary>
     public static void Draw(SKCanvas canvas, IReadOnlyList<AnnotShape> shapes, SKImage? frozen,
-        AnnotShape? selected, PxPoint windowOrigin, float dpi)
+        AnnotShape? selected, PxPoint windowOrigin, float dpi,
+        AnnotShape? draft = null, bool textEditing = false)
     {
         canvas.Save();
         canvas.Translate(-windowOrigin.X, -windowOrigin.Y);
         foreach (var s in shapes)
             DrawShape(canvas, s, frozen, windowOrigin, dpi);
 
+        // §14 编辑中的文本草稿(未入文档):文本 + 闪烁光标 + 虚线编辑框
+        if (draft is { Type: AnnotToolType.Text } te)
+        {
+            DrawShape(canvas, te, frozen, windowOrigin, dpi);
+            if (textEditing)
+                DrawTextEditingChrome(canvas, te, dpi);
+        }
+
         if (selected is { } sel)
             DrawSelectionChrome(canvas, sel, dpi);
         canvas.Restore();
+    }
+
+    /// <summary>文本编辑态提示:虚线框 + 闪烁光标(500ms 周期)。</summary>
+    private static void DrawTextEditingChrome(SKCanvas canvas, AnnotShape te, float dpi)
+    {
+        var b = te.Bounds;
+        using var dash = new SKPaint
+        {
+            Color = new SKColor(0x32, 0xAD, 0xE6),
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 1f,
+            IsAntialias = false,
+            PathEffect = SKPathEffect.CreateDash(new float[] { 4f, 3f }, 0f),
+        };
+        canvas.DrawRect(new SKRect(b.X - 3, b.Y - 3, b.X + b.Width + 3, b.Y + b.Height + 3), dash);
+
+        // 光标:末行末尾竖线,500ms 周期闪烁
+        if (DateTime.Now.Millisecond < 250) return;
+        float fontSize = AnnotShape.FontSizeFromStroke(te.StrokeWidth) * MathF.Max(1f, dpi);
+        var lines = (te.Text ?? string.Empty).Split('\n');
+        string last = lines[^1];
+        using var font = new SKFont(UiTypeface, fontSize);
+        float w = last.Length > 0 ? font.MeasureText(last) : 0;
+        var m = font.Metrics;
+        float lineH = m.Descent - m.Ascent;
+        float cx = b.X + w + 1f;
+        float cyTop = b.Y + lineH * (lines.Length - 1) + m.Ascent;
+        using var caret = new SKPaint { Color = new SKColor(0x32, 0xAD, 0xE6), StrokeWidth = MathF.Max(1f, 1.5f * dpi), IsAntialias = false };
+        canvas.DrawLine(cx, cyTop, cx, cyTop + lineH, caret);
     }
 
     private static SKColor ToColor(int argb)
@@ -139,6 +197,25 @@ internal static class AnnotationRenderer
                     canvas.Restore();
                 }
                 break;
+
+            case AnnotToolType.Text:
+            {
+                // §14 文本:多行,字号 = 粗细档映射 ×DPI;编辑态由 DrawTextEditingChrome 补光标
+                float fontSize = AnnotShape.FontSizeFromStroke(s.StrokeWidth) * MathF.Max(1f, dpi);
+                using var font = new SKFont(UiTypeface, fontSize);
+                var metrics = font.Metrics;
+                float lineH = metrics.Descent - metrics.Ascent;
+                var lines = (s.Text ?? string.Empty).Split('\n');
+                float y = b.Y - metrics.Ascent;
+                using var textPaint = new SKPaint { Color = ToColor(s.ColorArgb), IsAntialias = true };
+                foreach (var line in lines)
+                {
+                    if (line.Length > 0)
+                        canvas.DrawText(line, b.X, y, SKTextAlign.Left, font, textPaint);
+                    y += lineH;
+                }
+                break;
+            }
 
             case AnnotToolType.Number:
             {
@@ -509,6 +586,38 @@ internal static class AnnotationRenderer
                     new SKPaint { Color = icon.Color, IsAntialias = true });
                 break;
             }
+            case AnnotToolType.Text:
+            {
+                using var font = new SKFont(SKTypeface.FromFamilyName("Segoe UI", SKFontStyle.Bold) ?? SKTypeface.Default, q * 1.5f);
+                canvas.DrawText("T", c.X, c.Y + q * 0.55f, SKTextAlign.Center, font,
+                    new SKPaint { Color = icon.Color, IsAntialias = true });
+                break;
+            }
         }
+    }
+
+    /// <summary>元素悬停青框(§13:2px #00E5FF)。</summary>
+    public static void DrawElementHighlight(SKCanvas canvas, PxRect bounds, PxPoint windowOrigin)
+    {
+        canvas.Save();
+        canvas.Translate(-windowOrigin.X, -windowOrigin.Y);
+        using var paint = new SKPaint
+        {
+            Color = new SKColor(0x00, 0xE5, 0xFF),
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 2f,
+            IsAntialias = false,
+        };
+        canvas.DrawRect(new SKRect(bounds.X, bounds.Y, bounds.X + bounds.Width, bounds.Y + bounds.Height), paint);
+        canvas.Restore();
+    }
+
+    /// <summary>元素检测"检测中"提示:屏幕底部中央小字(§13 空响应软处理)。</summary>
+    public static void DrawDetectingHint(SKCanvas canvas, int windowWidth, int windowHeight, float dpi)
+    {
+        float fontSize = MathF.Max(11f, 12f * dpi);
+        using var font = new SKFont(UiTypeface, fontSize);
+        using var paint = new SKPaint { Color = new SKColor(0x00, 0xE5, 0xFF, 210), IsAntialias = true };
+        canvas.DrawText("元素检测中…", windowWidth / 2f, windowHeight - 12f * dpi, SKTextAlign.Center, font, paint);
     }
 }

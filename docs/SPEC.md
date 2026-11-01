@@ -383,3 +383,48 @@ public sealed class HotCornerMonitor : IDisposable {
 ## M2a 验收
 - build/test 全绿;各模块自验:标注=探针导出 10 工具绘制 PNG 断言;元素检测=记事本冒烟;伪透明=真实桌面目测+隐藏桌面回退棋盘;历史/触发角=TestRpc/单测。
 - E2E 扩展(run-e2e v2:标注绘制驱动/pins 背景断言)由 lead 在四模块合入后统一扩展跑通。
+---
+
+# M2b 契约增补(元素检测消费 / 文本标注 / 白板 / 超级截屏 / HDR / 贴图裁剪 / 历史回放)
+
+> 文件域与 M2a 相同:Overlay / Core / Pin / App 四线并行。红线全部有效(UIA 隔离、内容级自验、隐藏桌面纪律、单一驱动)。
+
+## 13. 元素检测消费(Overlay)[owner: overlay-dev]
+- Tab 键切换 窗口检测/元素检测 两模式(悬停高亮:窗口=蓝框 2px #00A8FF,元素=青框 2px #00E5FF);元素模式下滚轮=元素层级切换(HitTest 链上下移动);元素模式单击=选区设为该元素 Bounds(进入手选相位,可再调整)。
+- 构造注入:`SnipOverlay` 可选参数 `Func<PxPoint, IReadOnlyList<ElementInfo>>? elementHitTest`(缺省 null=无元素模式);内部自行节流(命中结果 80ms 缓存)。
+- 空响应语义:ElementDetector 超时返回空是正常(§10),UI 按"保持上次高亮+状态栏提示检测中"处理,勿当致命。
+
+## 14. 文本标注(Overlay)[owner: overlay-dev]
+- 第 11 工具:点击创建文本框(光标闪烁),键入内容,Enter 提交/Shift+Enter 换行/点击外部提交;选中文本后可拖动/改色/改字号(粗细档位映射 12/16/20/28/36px×DPI);Del 删除;Ctrl+Z/Y 走统一栈。旋转拖点 = M3。
+
+## 15. 白板模式(Overlay 会话 + App 命令)[owner: overlay-dev 会话 / app-dev 命令]
+- `WhiteboardSession`(Overlay 新文件):全屏纯色面板(默认白),复用 AnnotDocument/Renderer/Toolbar/Controller 全套标注能力;空格工具条;Esc 退出(直接退出,PerfLog 记录);双击 Esc 不做(v1 简化)。
+- 构造:`WhiteboardSession(IReadOnlyList<DisplayInfo> displays, int argb = 0xFFFFFFFF)`;事件 Confirmed(byte[]? png 导出,M2c 落盘)/ Cancelled;PerfLog 打点。
+- App 接入:CLI `whiteboard [--color #RRGGBB] [--active-screen]` + RPC `{"cmd":"whiteboard","color":"#RRGGBB"}`(app-dev)。
+
+## 16. 超级截屏(Core 触发器 + App 集成)[owner: core-dev 触发器 / app-dev 集成]
+```csharp
+// Core 新增 src/OpenSnip.Core/Input/SuperSnipTrigger.cs
+public sealed class SuperSnipTrigger : IDisposable
+{
+    public bool Enabled { set; }            // LL 键盘钩子:Win 按下期间吞掉 Win 键
+    public event Action? SnipRequested;      // Win 按住 + 左键按下 → 触发(钩子线程)
+}
+```
+- 语义 v1:Enabled 期间 Win 全部被吞(开始菜单不可用,Snipaste 同款已知限制);默认关闭,config.ini [SuperSnip] enabled。
+- App 集成:SnipRequested → 交互截屏;config 装配 + Dispose 链。
+
+## 17. HDR 色彩修正(Core)[owner: core-dev]
+- ScreenCaptureService:HDR 屏(DisplayInfo.IsHdr=true)捕获后按 SDR 白电平增益修正(读 DisplayConfig ADVANCED_COLOR_INFO DesiredACIIdeallyBrightInNits,增益=nits/80,钳位 1.0~4.0);开关 config.ini [Capture] hdr_correction(默认 true);PerfLog 打点 "hdr-correction applied gain=x.x"。
+- 单测:修正数学表驱动断言(合成 nits/像素→期望输出),不依赖真 HDR 屏。
+
+## 18. 贴图裁剪(Pin)[owner: pin-dev]
+- 右键菜单"裁剪":进入裁剪态(半透明遮罩+窗口内拖框选)→ Enter/双击应用(位图与窗口同步裁剪,CurrentRect 更新)→ Esc 取消。
+
+## 19. 历史回放集成(App)[owner: app-dev]
+- SnipService 进入交互截屏时读 HistoryStore 最近 N(默认 10)帧 → 传入 SnipOverlay historyFrames(展平映射:第 k 帧第 d 屏 = 列表[(k-1)*displays.Count+d],当前仅单屏保证正确);帧 0=本次 capture。
+- TestRpc 扩展 `{"cmd":"snip.setFrame","index":N}`(调 Overlay 切帧,E2E 断言用)。
+
+## M2b 验收
+- build/test 全绿;各模块内容级自验(文本=探针断言;白板=snapshot 断言纯色+标注;超级截屏=触发器行为级单测(不碰真实输入);HDR=表驱动数学断言;裁剪=探针断言;回放=setFrame 后 snapshot 帧内容变化)。
+- E2E v3(lead):whiteboard/super-snip/history 回放驱动断言,四模块合入后统一跑。

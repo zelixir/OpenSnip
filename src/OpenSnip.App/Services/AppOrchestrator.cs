@@ -24,6 +24,8 @@ public sealed class AppOrchestrator : IDisposable
     private readonly AppConfig _config;
     private readonly HistoryStore _history;
     private readonly HotCornerAdapter _hotCorners;
+    private readonly SuperSnipAdapter _superSnip;
+    private readonly WhiteboardService _whiteboard = new();
     private readonly TestRpcService _testRpc;
     private readonly bool _testMode;   // §8.2/§8.4:--test-rpc 测试模式
     private GlobalHotkeyManager? _hotkeys;
@@ -36,11 +38,13 @@ public sealed class AppOrchestrator : IDisposable
         _history = new HistoryStore(AppPaths.HistoryDirectory);
         _uiDispatcher = Dispatcher.CurrentDispatcher;   // OnStartup 在 UI 线程 new 本类
         _outputs = new OutputRunner(_sta, _pins, _config, _history);
-        _snip = new SnipService(_sta, _outputs, testMode);
+        _snip = new SnipService(_sta, _outputs, testMode, _history);
         _paste = new PasteService(_sta, _pins);
         _ipc = new IpcServer(HandleIpcCommandAsync);
         // §12 触发角:Core.HotCornerMonitor 经适配层接入(core-dev 产物就绪即生效)
         _hotCorners = HotCornerAdapter.Create(TimeSpan.FromMilliseconds(_config.DwellMs));
+        // §16 超级截屏:Core.SuperSnipTrigger 经适配层接入(同上)
+        _superSnip = SuperSnipAdapter.Create();
         // §8.2 测试 RPC:snip.interactive / 遮罩驱动 / pins / tray 状态源 / paste / history / corners(仅 --test-rpc 模式 Start)
         _testRpc = new TestRpcService(
             targets => _snip.StartInteractiveAsync("test-rpc", targets),
@@ -49,7 +53,13 @@ public sealed class AppOrchestrator : IDisposable
             () => _tray.IsReady,
             () => _paste.PinFromClipboard("test-rpc"),
             _history,
-            CornerSet);
+            CornerSet,
+            idx => _snip.TryPostSetFrame(idx),
+            (argb, active) => Task.Run(() =>
+            {
+                var (okW, errW, png) = _whiteboard.Run(argb, active);
+                return (okW, errW);
+            }));
     }
 
     /// <summary>§12 corners.set 的实现:运行时开关(需 Core.HotCornerMonitor 就绪)。</summary>
@@ -135,6 +145,18 @@ public sealed class AppOrchestrator : IDisposable
         {
             PerfLog.Log("App", $"hotcorner:init available=False reason={_hotCorners.UnavailableReason}");
         }
+
+        // §16 超级截屏:就绪则按配置启用(Win+左键 → 交互截屏)
+        if (_superSnip.Available)
+        {
+            _superSnip.SnipRequested += () => _ = StartInteractiveSafe("supersnip");
+            _superSnip.Enabled = _config.SuperSnipEnabled;
+            PerfLog.Log("App", $"supersnip:init available=True enabled={_config.SuperSnipEnabled}");
+        }
+        else
+        {
+            PerfLog.Log("App", $"supersnip:init available=False reason={_superSnip.UnavailableReason}");
+        }
         PerfLog.Log("App", $"config:loaded autosave={_config.AutoSave} outDir={(string.IsNullOrEmpty(_config.OutputDir) ? "(默认)" : _config.OutputDir)} historyDir={_history.Directory}");
 
         PerfLog.Log("App", $"startup:ready(托盘/热键/IPC·TestRpc/预热已安排) init={sw.Elapsed.TotalMilliseconds:F1}ms f1={f1} f3={f3} test={_testMode} process-ms={AppClock.ElapsedMs}");
@@ -181,6 +203,12 @@ public sealed class AppOrchestrator : IDisposable
             }
             case CliCommandKind.Paste:
                 return await Task.Run(() => _paste.PinFromClipboard(source));
+            case CliCommandKind.Whiteboard:
+            {
+                // §15:白板阻塞至退出;摘要回给客户端
+                var (ok, err, png) = _whiteboard.Run(options.WhiteboardColorArgb, options.ActiveScreen);
+                return (ok, ok ? $"whiteboard exited confirmed={png is not null} bytes={png?.Length ?? 0}" : err);
+            }
             case CliCommandKind.History:
             {
                 // §12:history [N] — 单行摘要回给客户端(回放 UI 为 M2b)
@@ -213,6 +241,7 @@ public sealed class AppOrchestrator : IDisposable
         _ = _ipc.DisposeAsync();
         _ = _testRpc.DisposeAsync();
         try { _hotCorners.Dispose(); } catch { /* 已释放 */ }
+        try { _superSnip.Dispose(); } catch { /* 已释放 */ }
 
         _uiDispatcher.BeginInvoke(() =>
         {
@@ -229,6 +258,7 @@ public sealed class AppOrchestrator : IDisposable
         try { _ipc.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); } catch { /* 退出路径 */ }
         try { _testRpc.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)); } catch { /* 退出路径 */ }
         try { _hotCorners.Dispose(); } catch { /* 退出路径 */ }
+        try { _superSnip.Dispose(); } catch { /* 退出路径 */ }
         _sta.Dispose();
     }
 }

@@ -45,7 +45,7 @@ public sealed class PinWindow : IDisposable
     // ===== 状态 =====
     private readonly object _gate = new();
     private readonly PinDispatcher _dispatcher;
-    private readonly NativeBitmap _image;      // 所有权:本窗口持有,关闭时 Dispose(契约 §3.3)
+    private readonly NativeBitmap _image;      // 所有权:本窗口持有,关闭时 Dispose(契约 §3.3)。裁剪不释放它:仅作初始渲染源,渲染源由 _baseBitmap 承担
     private PxRect _rect;
     private double _scale = 1.0;
     private byte _opacity = MaxOpacity;
@@ -74,6 +74,14 @@ public sealed class PinWindow : IDisposable
     private bool _refreshingBackground;       // 重截进行中(瞬隐期间不再调度/重入)
     private const int BgRefreshTimerId = 1;
     private const int BgRefreshDelayMs = 150;
+
+    // ===== 裁剪状态(契约 §18;仅贴图线程访问)=====
+    private bool _cropMode;              // 是否处于裁剪态
+    private PxRect? _cropSelection;      // 已框选区域(窗口内客户区物理 px;null=未选)
+    private bool _cropDragging;          // 正在拖框
+    private PxPoint _cropDragOrigin;     // 本次拖框起点(客户区)
+    private int _sourceW;                // 当前逻辑源尺寸(裁剪后随基准位图收缩;初始=原图)
+    private int _sourceH;
 
     /// <summary>窗口关闭后在贴图线程触发;触发时窗口与非托管资源已全部释放。</summary>
     public event Action<PinWindow>? Closed;
@@ -270,23 +278,58 @@ public sealed class PinWindow : IDisposable
                 return 1;   // ULW 窗口无背景可擦,防闪烁
 
             case NativeMethods.WM_LBUTTONDOWN:
-                OnDragStart(hWnd, lParam);
+                if (_cropMode)
+                {
+                    OnCropDragStart(lParam);   // 框选起点(不清已有选区:双击应用的 down/up 序列不破坏选区)
+                }
+                else
+                {
+                    OnDragStart(hWnd, lParam);
+                }
                 return 0;
 
             case NativeMethods.WM_MOUSEMOVE:
-                OnMouseMove(wParam, lParam);
+                if (_cropMode)
+                {
+                    OnCropDragMove(lParam);
+                }
+                else
+                {
+                    OnMouseMove(wParam, lParam);
+                }
                 return 0;
 
             case NativeMethods.WM_LBUTTONUP:
-                OnDragEnd();
+                if (_cropMode)
+                {
+                    OnCropDragEnd();
+                }
+                else
+                {
+                    OnDragEnd();
+                }
                 return 0;
 
             case NativeMethods.WM_LBUTTONDBLCLK:
-                BeginDestroy();   // 双击关闭(契约 §3.3)
+                if (_cropMode)
+                {
+                    ApplyCropFromSelection();   // 双击应用(契约 §18;选区无效则保持裁剪态)
+                }
+                else
+                {
+                    BeginDestroy();   // 双击关闭(契约 §3.3)
+                }
                 return 0;
 
             case NativeMethods.WM_RBUTTONUP:
-                ShowContextMenu(hWnd);
+                if (_cropMode)
+                {
+                    CancelCrop();   // 裁剪态中右键 = 取消(不弹菜单)
+                }
+                else
+                {
+                    ShowContextMenu(hWnd);
+                }
                 return 0;
 
             case NativeMethods.WM_MOUSEWHEEL:
@@ -302,6 +345,22 @@ public sealed class PinWindow : IDisposable
                     RefreshPseudoBackgroundNow();
                 }
                 return 0;
+
+            case NativeMethods.WM_KEYDOWN:
+                if (_cropMode)
+                {
+                    int vk = (int)wParam.ToInt64() & 0xFF;
+                    if (vk == 0x0D)
+                    {
+                        ApplyCropFromSelection();   // Enter 应用(契约 §18)
+                    }
+                    else if (vk == 0x1B)
+                    {
+                        CancelCrop();               // Esc 取消(契约 §18)
+                    }
+                    return 0;
+                }
+                return NativeMethods.DefWindowProcW(hWnd, msg, wParam, lParam);
 
             // WM_DPICHANGED(PMv2 跨屏拖动):v1 忽略,保持物理尺寸(贴图为物理像素快照,与 Snipaste 一致)
             default:
@@ -367,6 +426,10 @@ public sealed class PinWindow : IDisposable
 
     private void OnWheel(IntPtr wParam)
     {
+        if (_cropMode)
+        {
+            return;   // 裁剪态禁用缩放/透明度(防止选区坐标系漂移)
+        }
         int wp = unchecked((int)(long)wParam);
         int delta = (short)((wp >> 16) & 0xFFFF);
         bool ctrl = (wp & NativeMethods.MK_CONTROL) != 0;
@@ -399,8 +462,8 @@ public sealed class PinWindow : IDisposable
         {
             return;
         }
-        int newW = Math.Max(1, (int)Math.Round(_image.Width * newScale));
-        int newH = Math.Max(1, (int)Math.Round(_image.Height * newScale));
+        int newW = Math.Max(1, (int)Math.Round(_sourceW * newScale));
+        int newH = Math.Max(1, (int)Math.Round(_sourceH * newScale));
 
         int curX, curY, curW, curH;
         lock (_gate)
@@ -503,6 +566,7 @@ public sealed class PinWindow : IDisposable
             _ = NativeMethods.CheckMenuItem(menu, NativeMethods.MENU_ID_TOPMOST, _topmost ? NativeMethods.MF_CHECKED : 0);
             _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_STRING, (UIntPtr)NativeMethods.MENU_ID_CLICKTHROUGH, "鼠标穿透");
             _ = NativeMethods.CheckMenuItem(menu, NativeMethods.MENU_ID_CLICKTHROUGH, _clickThrough ? NativeMethods.MF_CHECKED : 0);
+            _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_STRING, (UIntPtr)NativeMethods.MENU_ID_CROP, "裁剪");
 
             // 背景模式子菜单(契约 §11):当前模式打勾;子菜单由父菜单 DestroyMenu 一并销毁
             IntPtr bgMenu = NativeMethods.CreatePopupMenu();
@@ -541,6 +605,9 @@ public sealed class PinWindow : IDisposable
                         break;
                     case NativeMethods.MENU_ID_CLICKTHROUGH:
                         ApplyClickThrough(!_clickThrough);
+                        break;
+                    case NativeMethods.MENU_ID_CROP:
+                        EnterCropMode();
                         break;
                     case NativeMethods.MENU_ID_CLOSE:
                         BeginDestroy();
@@ -764,6 +831,141 @@ public sealed class PinWindow : IDisposable
         _checkerboardBitmap = null;
     }
 
+    // ==================== 裁剪(契约 §18) ====================
+
+    /// <summary>进入裁剪态:半透明遮罩 + 窗口内拖框选;Enter/双击应用,Esc/右键取消。internal 供探针/测试驱动。</summary>
+    internal void EnterCropMode()
+    {
+        if (_hwnd == IntPtr.Zero || Volatile.Read(ref _destroyed) == 1 || _cropMode)
+        {
+            return;
+        }
+        _cropMode = true;
+        _cropSelection = null;
+        _cropDragging = false;
+        _ = NativeMethods.SetForegroundWindow(_hwnd);   // 确保键盘可达(Esc/Enter)
+        Commit();
+    }
+
+    /// <summary>退出裁剪态并恢复常规渲染(窗口与内容不变)。internal 供探针/测试驱动。</summary>
+    internal void CancelCrop()
+    {
+        if (!_cropMode)
+        {
+            return;
+        }
+        _cropMode = false;
+        _cropSelection = null;
+        _cropDragging = false;
+        Commit();
+    }
+
+    /// <summary>
+    /// 应用裁剪(契约 §18):位图与窗口同步裁剪,CurrentRect 更新。internal 供探针/测试驱动。
+    /// selection 为窗口内客户区物理 px(越界自动夹取);空选区(宽/高 &lt; 1)返回 false 且状态不变。
+    /// </summary>
+    internal bool ApplyCrop(PxRect selection)
+    {
+        if (!_cropMode || _baseBitmap is null || _scaledBitmap is null
+            || selection.Width < 1 || selection.Height < 1)
+        {
+            return false;
+        }
+        int x, y, w, h;
+        lock (_gate)
+        {
+            x = _rect.X; y = _rect.Y; w = _rect.Width; h = _rect.Height;
+        }
+
+        // 选区夹取到窗口内(探针/极端输入防御)
+        int selX = Math.Clamp(selection.X, 0, w - 1);
+        int selY = Math.Clamp(selection.Y, 0, h - 1);
+        int selW = Math.Clamp(selection.Width, 1, w - selX);
+        int selH = Math.Clamp(selection.Height, 1, h - selY);
+
+        // 窗口选区 → 源图区域(客户区物理 px ÷ 当前缩放;clamp 保证 ≥1×1 且不越界)
+        int sx = Math.Clamp((int)Math.Round(selX / _scale), 0, _sourceW - 1);
+        int sy = Math.Clamp((int)Math.Round(selY / _scale), 0, _sourceH - 1);
+        int sw = Math.Clamp((int)Math.Round(selW / _scale), 1, _sourceW - sx);
+        int sh = Math.Clamp((int)Math.Round(selH / _scale), 1, _sourceH - sy);
+
+        // 从当前预乘基准裁出新基准(1:1 像素拷贝,无重采样)
+        var newBase = new SKBitmap(new SKImageInfo(sw, sh, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(newBase))
+        {
+            canvas.DrawBitmap(_baseBitmap,
+                new SKRect(sx, sy, sx + sw, sy + sh),
+                new SKRect(0, 0, sw, sh),
+                SKSamplingOptions.Default, paint: null);
+        }
+
+        _baseBitmap.Dispose();
+        _baseBitmap = newBase;
+        _sourceW = sw;
+        _sourceH = sh;
+
+        // 窗口内容位图 = 新基准按当前缩放到选区尺寸(窗口物理尺寸)
+        var resized = PinRenderer.ResizePremul(_baseBitmap, selW, selH);
+        if (resized is null)
+        {
+            return false;   // 重采样失败:基准已更新但保持窗口/内容现状,可再次裁剪
+        }
+        _scaledBitmap?.Dispose();
+        _scaledBitmap = resized;
+
+        _cropMode = false;
+        _cropSelection = null;
+        _cropDragging = false;
+
+        SetWindowRect(x, y, selW, selH, sizeChanged: true);   // CurrentRect 同步更新(内含伪透明背景置脏)
+        Commit();
+        return true;
+    }
+
+    /// <summary>双击/Enter 入口:应用当前框选(无有效选区则保持裁剪态)。</summary>
+    private void ApplyCropFromSelection()
+    {
+        if (_cropSelection is PxRect r)
+        {
+            _ = ApplyCrop(r);
+        }
+    }
+
+    private void OnCropDragStart(IntPtr lParam)
+    {
+        _ = NativeMethods.SetCapture(_hwnd);
+        _cropDragging = true;
+        _cropDragOrigin = PointFromLParam(lParam);
+        // 不清空已有选区:双击应用的 down/up 消息序列不会破坏选区;重新拖动时从新起点覆盖
+    }
+
+    private void OnCropDragMove(IntPtr lParam)
+    {
+        if (!_cropDragging)
+        {
+            return;
+        }
+        var cur = PointFromLParam(lParam);
+        int w, h;
+        lock (_gate)
+        {
+            w = _rect.Width;
+            h = _rect.Height;
+        }
+        int x0 = Math.Clamp(_cropDragOrigin.X, 0, w);
+        int y0 = Math.Clamp(_cropDragOrigin.Y, 0, h);
+        int x1 = Math.Clamp(cur.X, 0, w);
+        int y1 = Math.Clamp(cur.Y, 0, h);
+        _cropSelection = new PxRect(Math.Min(x0, x1), Math.Min(y0, y1), Math.Abs(x1 - x0), Math.Abs(y1 - y0));
+        Commit();   // 全窗 ULW 重绘:遮罩+选框即时反馈
+    }
+
+    private void OnCropDragEnd()
+    {
+        _cropDragging = false;
+        _ = NativeMethods.ReleaseCapture();
+    }
+
     /// <summary>存活句柄(已销毁返回 IntPtr.Zero;供虚拟桌面查询等跨线程使用)。</summary>
     internal IntPtr GetLiveHwnd() => Volatile.Read(ref _destroyed) == 1 ? IntPtr.Zero : _hwnd;
 
@@ -772,6 +974,8 @@ public sealed class PinWindow : IDisposable
     /// <summary>构建基准(原尺寸预乘)位图与当前缩放位图;仅构造期在贴图线程调用一次。</summary>
     private void BuildBitmaps()
     {
+        _sourceW = _image.Width;
+        _sourceH = _image.Height;
         // 契约 §2.2:WrapAsSkia 零拷贝包装;用完即弃 SKBitmap,NativeBitmap 留存到窗口关闭
         using var wrapped = BitmapConversion.WrapAsSkia(_image);
         _baseBitmap = PinRenderer.BuildPremulBase(wrapped);
@@ -798,7 +1002,15 @@ public sealed class PinWindow : IDisposable
             h = _rect.Height;
         }
         var background = GetBackgroundLayerForRender(w, h);
-        _lastCommitOk = _target.Commit(_hwnd, x, y, _scaledBitmap, _opacity, background);
+        SKRectI? cropSelection = null;
+        if (_cropMode)
+        {
+            var sel = _cropSelection;
+            cropSelection = sel is PxRect r && r.Width >= 1 && r.Height >= 1
+                ? new SKRectI(r.X, r.Y, r.X + r.Width, r.Y + r.Height)
+                : SKRectI.Empty;   // 未选:全窗遮罩
+        }
+        _lastCommitOk = _target.Commit(_hwnd, x, y, _scaledBitmap, _opacity, background, cropSelection);
     }
 
     // ==================== 销毁与清理 ====================

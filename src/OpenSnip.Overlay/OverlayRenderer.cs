@@ -23,7 +23,12 @@ internal readonly record struct RenderModel(
     float DpiScale,
     System.Collections.Generic.IReadOnlyList<AnnotShape>? Shapes = null, // §9 标注(空文档传空表即可)
     AnnotShape? SelectedShape = null,                                    // 选中态(高亮框+8 锚点)
-    AnnotToolbar? Toolbar = null);                                           // 工具条(Visible 由对象决定)
+    AnnotToolbar? Toolbar = null,                                        // 工具条(Visible 由对象决定)
+    AnnotShape? DraftShape = null,                                       // §14 编辑中的文本草稿
+    bool TextEditing = false,                                            // §14 文本编辑态(光标闪烁)
+    PxRect? ElementHighlight = null,                                     // §13 元素悬停青框
+    bool DetectingHint = false,                                          // §13 "检测中"提示
+    bool Whiteboard = false);                                            // §15 白板:无遮罩/无选区 UI/无准线
 
 /// <summary>绘制器本身无状态(画笔缓存在实例上,仅 Overlay UI 线程使用)。</summary>
 internal sealed class OverlayRenderer
@@ -131,11 +136,20 @@ internal sealed class OverlayRenderer
         }
 
         // 1.5) 标注(SPEC §9:画于冻结画面之上、遮罩之下;标注限定选区内,选区内无遮罩)
-        if (m.Shapes is { Count: > 0 })
-            AnnotationRenderer.Draw(canvas, m.Shapes, m.Frozen, m.SelectedShape, m.WindowOrigin, m.DpiScale);
+        if (m.Shapes is { Count: > 0 } || m.DraftShape is not null)
+            AnnotationRenderer.Draw(canvas, m.Shapes ?? Array.Empty<AnnotShape>(), m.Frozen, m.SelectedShape,
+                m.WindowOrigin, m.DpiScale, m.DraftShape, m.TextEditing);
 
-        // 2) 遮罩(SrcOver 叠加):有选区 → "回"形四矩形(选区内全亮);无选区 → 全屏 50%
-        if (m.Selection is { } sel)
+        // 1.6) §13 元素悬停青框(Hover 相位,窗口蓝框不并存)
+        if (m.ElementHighlight is { } eh)
+            AnnotationRenderer.DrawElementHighlight(canvas, eh, m.WindowOrigin);
+
+        // 2) 遮罩 + 选区 UI(白板模式全部跳过:纯画面 + 标注,§15)
+        if (m.Whiteboard)
+        {
+            // 白板:直接进入选区元素之外的 UI(工具条/文本光标已在标注层),无遮罩
+        }
+        else if (m.Selection is { } sel)
         {
             var local = ToLocal(m, sel);
             float L = local.Left, T = local.Top, R = local.Right, B = local.Bottom;
@@ -159,18 +173,22 @@ internal sealed class OverlayRenderer
                 DrawHighlight(canvas, m, hl);
         }
 
-        // 4) 十字准线(全屏 1px 半透明白;标注工具条可见时抑制,避免穿过标注)
+        // 4) 十字准线(全屏 1px 半透明白;标注工具条可见时抑制,避免穿过标注;白板不画)
         bool annotateMode = m.Toolbar is { Visible: true };
-        if (!annotateMode && m.CursorPt is { } cur)
+        if (!annotateMode && !m.Whiteboard && m.CursorPt is { } cur)
             DrawCrosshair(canvas, m, cur);
 
-        // 5) 放大镜(拖拽中隐藏;标注模式不画,工具条在附近)
-        if (!annotateMode && m.ShowMagnifier && m.CursorPt is { } cur2)
+        // 5) 放大镜(拖拽中隐藏;标注模式不画,工具条在附近;白板不画)
+        if (!annotateMode && !m.Whiteboard && m.ShowMagnifier && m.CursorPt is { } cur2)
             DrawMagnifier(canvas, m, cur2);
 
         // 6) 工具条(最顶 UI,§9)
         if (annotateMode)
             AnnotationRenderer.DrawToolbar(canvas, m.Toolbar!, m.WindowOrigin, m.CursorPt, m.DpiScale);
+
+        // 7) §13 "检测中"提示(空响应软处理)
+        if (m.DetectingHint)
+            AnnotationRenderer.DrawDetectingHint(canvas, m.WindowWidth, m.WindowHeight, m.DpiScale);
 
         canvas.Flush();
     }

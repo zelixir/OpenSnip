@@ -603,6 +603,31 @@ try {
   }
   Add-Step 'overlay.shot.mask' $true ("§8.4 色带采样 $($band1.Sampled) 点全部命中(压暗系数容忍, max=$($band1.MaxBrightness)); snapshot $($script:BaseWidth)x$(Get-Prop $s1 'h'); out=$maskPng")
 
+  # ---------- snip.setFrame(§19 历史回放;条件严格:历史有货才断言切帧变化)----------
+  $hlPre = Invoke-TestRpc -Payload @{ cmd = 'history.list' }
+  $hlTotalPre = 0
+  if (Get-Prop $hlPre 'ok') { $hlTotalPre = [int](Get-Prop $hlPre 'total') }
+  if ($hlTotalPre -ge 1) {
+    $mFrame0 = Get-FileMd5 $maskPng
+    $sf1 = Invoke-TestRpc -Payload @{ cmd = 'snip.setFrame'; index = 1 }
+    Start-Sleep -Milliseconds 900
+    $frame1Png = Join-Path $ArtDir 'overlay-frame1.png'
+    [void](Invoke-TestRpc -Payload @{ cmd = 'overlay.snapshot'; out = $frame1Png })
+    $mFrame1 = Get-FileMd5 $frame1Png
+    $sf0 = Invoke-TestRpc -Payload @{ cmd = 'snip.setFrame'; index = 0 }
+    Start-Sleep -Milliseconds 900
+    $frameBackPng = Join-Path $ArtDir 'overlay-frame0.png'
+    [void](Invoke-TestRpc -Payload @{ cmd = 'overlay.snapshot'; out = $frameBackPng })
+    $mBack = Get-FileMd5 $frameBackPng
+    if ((Get-Prop $sf1 'ok') -and (Get-Prop $sf0 'ok')) {
+      if ($mFrame1 -eq $mFrame0) { Add-Step 'snip.setFrame' $false -Soft 'setFrame(1) 后画面与帧0 相同(历史帧内容恰好一致或切帧未生效)' }
+      elseif ($mBack -ne $mFrame0) { Add-Step 'snip.setFrame' $false -Soft 'setFrame(0) 未恢复帧0 画面' }
+      else { Add-Step 'snip.setFrame' $true "切帧变化($mFrame0 → $mFrame1)且切回恢复; history.total=$hlTotalPre" }
+    } else { Add-Step 'snip.setFrame' $false -Soft 'setFrame 响应非 ok' }
+  } else {
+    Add-Step 'snip.setFrame' $true -Soft "history.total=$hlTotalPre(<1), 切帧断言跳过"
+  }
+
   # ---------- snip.setRegion ----------
   $sr = Invoke-TestRpc -Payload @{ cmd = 'snip.setRegion'; x = $RegionX; y = $RegionY; w = $RegionW; h = $RegionH }
   if (-not (Get-Prop $sr 'ok')) {
@@ -821,6 +846,15 @@ exit 0
     $c2 = Invoke-TestRpc -Payload @{ cmd = 'corners.set'; enabled = $true }
     if (-not (Get-Prop $c2 'ok')) { Add-Step 'corners.set' $false -Soft '第二轮 enabled=true 非 ok' }
     else { Add-Step 'corners.set' $true 'false→true 往返 ok(触发角开关链路通)' }
+  }
+
+  # ---------- whiteboard(§15 受理断言;进程由 app.exit/kill 兜底清理)----------
+  $wb = Invoke-TestRpc -Payload @{ cmd = 'whiteboard'; color = '#00FF00' }
+  if (-not (Get-Prop $wb 'ok')) {
+    Add-Step 'whiteboard' $false -Soft ('whiteboard 响应非 ok(协议未实现?): ' + (ConvertTo-Json -Compress -InputObject $wb -Depth 5))
+  } else {
+    Start-Sleep -Milliseconds 1200
+    Add-Step 'whiteboard' $true '受理 ok=true(白板会话已启动; 深度渲染断言由 T18Probe 覆盖)'
   }
 
   # ---------- app.exit(探测扩展命令,回退 vdesk kill) ----------

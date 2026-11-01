@@ -42,6 +42,9 @@ public sealed class AppConfig
     /// <summary>[HotCorners] actions:四角动作(左上,右上,左下,右下);可选 show-images/hide-images/snip/paste/无。</summary>
     public string[] CornerActions = { "无", "无", "无", "无" };
 
+    /// <summary>[SuperSnip] enabled:超级截屏(Win+左键)总开关,默认 false(§16)。</summary>
+    public bool SuperSnipEnabled;
+
     /// <summary>加载 config.ini;不存在时写出默认模板。返回 (配置, 配置文件路径)。</summary>
     public static AppConfig Load()
     {
@@ -77,6 +80,10 @@ public sealed class AppConfig
                 if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase)) cfg.HotCornersEnabled = val.Equals("true", StringComparison.OrdinalIgnoreCase);
                 else if (key.Equals("dwell_ms", StringComparison.OrdinalIgnoreCase) && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ms)) cfg.DwellMs = Math.Clamp(ms, 50, 5000);
                 else if (key.Equals("actions", StringComparison.OrdinalIgnoreCase)) cfg.CornerActions = ParseActions(val);
+            }
+            else if (section.Equals("SuperSnip", StringComparison.OrdinalIgnoreCase))
+            {
+                if (key.Equals("enabled", StringComparison.OrdinalIgnoreCase)) cfg.SuperSnipEnabled = val.Equals("true", StringComparison.OrdinalIgnoreCase);
             }
         }
         return cfg;
@@ -117,6 +124,10 @@ public sealed class AppConfig
         sb.AppendLine("dwell_ms=" + DwellMs.ToString(CultureInfo.InvariantCulture));
         sb.AppendLine("# 四角动作,逗号分隔,顺序:左上,右上,左下,右下;可选 show-images/hide-images/snip/paste/无");
         sb.AppendLine("actions=" + string.Join(",", CornerActions));
+        sb.AppendLine();
+        sb.AppendLine("[SuperSnip]");
+        sb.AppendLine("# 超级截屏(Win 按住 + 左键;启用期间 Win 键被吞,开始菜单不可用)");
+        sb.AppendLine("enabled=" + (SuperSnipEnabled ? "true" : "false"));
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
     }
 }

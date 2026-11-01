@@ -24,6 +24,18 @@ public sealed class ScreenCaptureService : IDisposable
         get { lock (_gate) return _lastContentRatio; }
     }
 
+    private bool _hdrCorrectionEnabled = true;
+
+    /// <summary>
+    /// HDR 屏 SDR 白电平增益修正开关(契约 §17,默认 true)。
+    /// App 从 config.ini [Capture] hdr_correction 装配到此处。
+    /// </summary>
+    public bool HdrCorrectionEnabled
+    {
+        get { lock (_gate) return _hdrCorrectionEnabled; }
+        set { lock (_gate) _hdrCorrectionEnabled = value; }
+    }
+
 
     public ScreenCaptureService()
     {
@@ -79,6 +91,7 @@ public sealed class ScreenCaptureService : IDisposable
                 try
                 {
                     var bmp = session.CaptureFrame();
+                    ApplyHdrCorrection(bmp, display);
                     swDxgi.Stop();
                     _lastUsedMode = CaptureMode.DxgiDuplication;
                     _lastContentRatio = ContentProbe.NonBlackRatio(bmp);
@@ -109,6 +122,7 @@ public sealed class ScreenCaptureService : IDisposable
             // BitBlt 回退
             var sw = Stopwatch.StartNew();
             var gdi = GdiCapture.Capture(display);
+            ApplyHdrCorrection(gdi, display);
             sw.Stop();
             _lastUsedMode = CaptureMode.GdiBitBlt;
             _lastContentRatio = ContentProbe.NonBlackRatio(gdi);
@@ -118,6 +132,31 @@ public sealed class ScreenCaptureService : IDisposable
                 $"非黑占比={_lastContentRatio:P1}");
             return gdi;
         }
+    }
+
+    /// <summary>
+    /// HDR 屏 SDR 白电平增益修正(契约 §17):nits/80 钳位 1.0~4.0,RGB 提升、Alpha 保持。
+    /// 开关 HdrCorrectionEnabled(默认 true);PerfLog 打点 "hdr-correction applied gain=x.x"。
+    /// </summary>
+    private void ApplyHdrCorrection(NativeBitmap bmp, DisplayInfo display)
+    {
+        bool enabled;
+        lock (_gate)
+        {
+            enabled = _hdrCorrectionEnabled && !_disposed;
+        }
+        if (!enabled || !display.IsHdr)
+        {
+            return;
+        }
+        var gain = HdrWhiteLevel.GetGain(display.DeviceName);
+        if (gain <= 1.0001)
+        {
+            return; // 白电平未提升/查询失败:无需修正
+        }
+        HdrCorrection.Apply(bmp, gain);
+        var gainText = gain.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+        PerfLog.Log("Core", $"hdr-correction applied gain={gainText}");
     }
 
     /// <summary>

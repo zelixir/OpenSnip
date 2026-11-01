@@ -37,6 +37,7 @@ internal static unsafe class NativeMethods
     internal const uint WM_MOUSEWHEEL = 0x020Au;
     internal const uint WM_APP = 0x8000u;
     internal const uint WM_TIMER = 0x0113u;
+    internal const uint WM_KEYDOWN = 0x0100u;
 
     /// <summary>调度唤醒消息:贴图线程收到后排空工作队列。</summary>
     internal const uint WM_APP_DISPATCH = WM_APP + 1;
@@ -72,6 +73,7 @@ internal static unsafe class NativeMethods
     internal const uint MENU_ID_TOPMOST = 1;
     internal const uint MENU_ID_CLICKTHROUGH = 2;
     internal const uint MENU_ID_CLOSE = 3;
+    internal const uint MENU_ID_CROP = 4;
 
     /// <summary>背景模式子菜单首 ID:FIRST+n,n=0..3 依次对应 PinBackground 四模式(契约 §11)。</summary>
     internal const uint MENU_ID_BG_FIRST = 0x10u;

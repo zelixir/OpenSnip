@@ -84,7 +84,7 @@ internal sealed class AnnotToolbar
         float gap = 2f * dpi;
 
         // 两行:行1 = 选择+10 工具+撤销/重做/清空/确认/取消(16 槽);行2 = 8 色+自定义+5 粗细(14 槽)
-        int row1 = 16; // 两行布局:行1 = 选择+10 工具+5 动作;行2 = 8 色+自定义+5 粗细
+        int row1 = 17; // 两行布局:行1 = 选择+11 工具(§14 文本)+5 动作;行2 = 8 色+自定义+5 粗细
         float rowW = row1 * (unit + gap) - gap + pad * 2;
         float rowH = unit;
         float totalH = pad * 2 + rowH * 2 + gap;
@@ -108,7 +108,7 @@ internal sealed class AnnotToolbar
 
         // 行 1:选择槽(-1)+ 10 工具
         AddItem(AnToolbarAction.Tool, -1);
-        for (int t = 0; t < 10; t++) AddItem(AnToolbarAction.Tool, t);
+        for (int t = 0; t < 11; t++) AddItem(AnToolbarAction.Tool, t);
         // 行 1:撤销/重做/清空/确认/取消
         AddItem(AnToolbarAction.Undo, 0);
         AddItem(AnToolbarAction.Redo, 0);

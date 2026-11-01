@@ -35,6 +35,8 @@ public sealed class TestRpcService : IAsyncDisposable
     private readonly Func<(bool Ok, string? Error)> _paste;
     private readonly HistoryStore _history;
     private readonly Func<bool, (bool Ok, string? Error)> _cornerSet;
+    private readonly Func<int, bool> _setFrame;                                  // §19:切回放帧
+    private readonly Func<int, bool, Task<(bool Ok, string? Error)>> _whiteboard; // §15:白板(argb, activeScreen)
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -45,7 +47,9 @@ public sealed class TestRpcService : IAsyncDisposable
         Func<bool> trayReady,
         Func<(bool Ok, string? Error)> paste,
         HistoryStore history,
-        Func<bool, (bool Ok, string? Error)> cornerSet)
+        Func<bool, (bool Ok, string? Error)> cornerSet,
+        Func<int, bool> setFrame,
+        Func<int, bool, Task<(bool Ok, string? Error)>> whiteboard)
     {
         _startSnip = startSnip;
         _activeOverlay = activeOverlay;
@@ -54,6 +58,10 @@ public sealed class TestRpcService : IAsyncDisposable
         _paste = paste;
         _history = history;
         _cornerSet = cornerSet;
+        _setFrame = setFrame;
+        _whiteboard = whiteboard;
+        _setFrame = setFrame;
+        _whiteboard = whiteboard;
     }
 
     public void Start()
@@ -197,6 +205,36 @@ public sealed class TestRpcService : IAsyncDisposable
                 {
                     ["ok"] = true, ["total"] = _history.Total, ["count"] = items.Count, ["items"] = arr,
                 }, JsonOpts);
+            }
+            case "snip.setFrame": // §19:切回放帧 {index:N}(0=本次 capture)
+            {
+                if (!TryGetInt(root, "index", out var fi) || fi < 0)
+                {
+                    return Err("snip.setFrame 需要非负整数 index(0=本次 capture)");
+                }
+                return _setFrame(fi) ? Ok() : Err("无遮罩活动");
+            }
+            case "whiteboard": // §15:白板 {color?:"#RRGGBB"}
+            {
+                int argb = -1;
+                if (root.TryGetProperty("color", out var colorEl))
+                {
+                    if (colorEl.ValueKind != JsonValueKind.String
+                        || !colorEl.GetString()!.StartsWith('#')
+                        || !int.TryParse(colorEl.GetString()![1..], System.Globalization.NumberStyles.HexNumber, null, out var rgb))
+                    {
+                        return Err("color 需要字符串 \"#RRGGBB\"");
+                    }
+                    argb = unchecked((int)0xFF000000u) | rgb;
+                }
+                // 受理即应答:会话阻塞至人工退出,与 snip.interactive 同模式
+                var task = Task.Run(() => _whiteboard(argb, false));
+                if (task.Wait(500))
+                {
+                    var (okW, errW) = task.Result;
+                    return okW ? Ok() : Err(errW ?? "白板启动失败");
+                }
+                return Ok();
             }
             case "corners.set": // §12:触发角运行时开关 {enabled:bool}
             {

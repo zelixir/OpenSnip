@@ -4,7 +4,7 @@ using OpenSnip.Core;
 
 namespace OpenSnip.Overlay.Annotation;
 
-/// <summary>标注工具(SPEC §9 十工具;文本/放大镜/圆角矩形 = M3)。</summary>
+/// <summary>标注工具(SPEC §9 十工具 + §14 文本 = 11;放大镜/圆角矩形 = M3)。</summary>
 public enum AnnotToolType
 {
     Rectangle = 0,
@@ -17,6 +17,7 @@ public enum AnnotToolType
     Blur,
     Eraser,
     Number,
+    Text,       // §14(M2b):点击创建/键入/Enter 提交/Shift+Enter 换行
 }
 
 /// <summary>直线箭头样式(无/单/双)。</summary>
@@ -64,6 +65,10 @@ public sealed class AnnotShape
 
     /// <summary>点集(折线/画笔/记号笔;其余工具为空)。</summary>
     public List<PxPoint> Points { get; set; } = new();
+
+    /// <summary>§14:粗细档位(1-5)映射文本字号 12/16/20/28/36(逻辑 px,渲染时 ×DPI)。</summary>
+    public static float FontSizeFromStroke(float strokeWidth)
+        => (strokeWidth switch { <= 1 => 12f, <= 2 => 16f, <= 3 => 20f, <= 4 => 28f, _ => 36f });
 
     public AnnotShape Clone()
     {

@@ -30,6 +30,7 @@ internal sealed class OverlaySession
     private readonly WindowHitTester? _hitTester;
     private readonly PxRect _virtualDesktop;                   // 各屏 Bounds 包围盒(移动选区时夹取)
     private readonly Func<DisplayInfo, SKImage?>? _frozenImageProvider; // §9 合成用:display → 冻结帧(窗口 FrozenImage)
+    private readonly ElementPicker _elementPicker;                     // §13 元素检测消费(Tab/滚轮/单击)
 
     // —— 悬停窗口(§2.4:HitTopToBottom 列表 + 滚轮切层级)——
     private IReadOnlyList<WindowInfo> _hits = Array.Empty<WindowInfo>();
@@ -53,14 +54,19 @@ internal sealed class OverlaySession
     /// <summary>M2a 标注控制器(SPEC §9):Selected 相位时优先消费鼠标/滚轮/键盘。</summary>
     public AnnotationController Annot { get; } = new();
 
+    /// <summary>§15 白板模式(由 SnipOverlay 设置):选区恒全幅,无选区 UI/遮罩。</summary>
+    public bool WhiteboardMode { get; set; }
+
     public OverlaySession(IReadOnlyList<DisplayInfo> displays,
         Dictionary<int, NativeBitmap?> frozen, HashSet<IntPtr> selfHwnds,
-        Func<DisplayInfo, SKImage?>? frozenImageProvider = null)
+        Func<DisplayInfo, SKImage?>? frozenImageProvider = null,
+        Func<PxPoint, IReadOnlyList<ElementInfo>>? elementHitTest = null)
     {
         _displays = displays;
         _frozen = frozen;
         _selfHwnds = selfHwnds;
         _frozenImageProvider = frozenImageProvider;
+        _elementPicker = new ElementPicker(elementHitTest);
         _virtualDesktop = ComputeVirtualDesktop(displays);
         try { _hitTester = new WindowHitTester(); }
         catch { _hitTester = null; } // Core 不可用时仅失去窗口高亮,手选流程不受影响
@@ -73,6 +79,9 @@ internal sealed class OverlaySession
         Cursor = pt;
         // M2a:标注层拖拽(绘制/移动/缩放/重画)优先于 M1 路由
         if (Phase == SnipPhase.Selected && Annot.HandleMouseMove(pt))
+            return;
+        // §13:元素模式悬停命中(80ms 节流;空响应软处理)
+        if (Phase == SnipPhase.Hover && _elementPicker.OnMouseMove(pt))
             return;
         switch (Drag)
         {
@@ -99,6 +108,18 @@ internal sealed class OverlaySession
         // M2a:工具条/形状选中/绘制优先(Selected 相位)
         if (Phase == SnipPhase.Selected && Selection is { } s0 && Annot.HandleMouseDown(pt))
             return;
+        if (WhiteboardMode) return; // §15:白板无选区操作(重选/移动),标注层已消费
+        // §13:元素模式单击 = 元素 Bounds 设为选区(进入手选相位,可再调整)
+        if (Phase == SnipPhase.Hover && _elementPicker.TakeClickSelection() is { } el && !el.Bounds.IsEmpty)
+        {
+            Selection = ClampToDesktop(el.Bounds);
+            Phase = SnipPhase.Selected;
+            Drag = DragKind.None;
+            HoverRect = null;
+            Annot.OnSelectionChanged(Selection.Value, _virtualDesktop.Width, _virtualDesktop.Height,
+                (float)(FindDisplay(pt)?.DpiScale ?? 1.0));
+            return;
+        }
         switch (Phase)
         {
             case SnipPhase.Hover:
@@ -170,6 +191,31 @@ internal sealed class OverlaySession
         if (Phase == SnipPhase.Hover) ProbeHover(pt); // 拖拽结束恢复窗口高亮
     }
 
+    /// <summary>§13:Tab 切换 窗口/元素 检测模式(未注入元素检测 = false)。</summary>
+    public bool ToggleHitMode() => _elementPicker.ToggleMode();
+
+    /// <summary>§15 白板初始化:恒 Selected 相位,选区 = 虚拟桌面全幅(标注/工具条立即可用)。</summary>
+    public void EnterWhiteboard()
+    {
+        WhiteboardMode = true;
+        Phase = SnipPhase.Selected;
+        Selection = _virtualDesktop;
+        Annot.OnSelectionChanged(_virtualDesktop, _virtualDesktop.Width, _virtualDesktop.Height,
+            (float)(_displays.FirstOrDefault(d => d.IsPrimary)?.DpiScale ?? 1.0));
+    }
+
+    /// <summary>§15 白板确认:主屏全幅 + 标注合成(复用 CompositeAnnotations)。</summary>
+    public SnipResult? BuildWhiteboardResult(DisplayInfo primary)
+    {
+        if (!_frozen.TryGetValue(primary.Index, out var src) || src is null) return null;
+        var b = primary.Bounds;
+        var result = NativeBitmap.Allocate(b.Width, b.Height);
+        result.CopyRegionFrom(src, 0, 0);
+        if (Annot.Document.Shapes.Count > 0)
+            CompositeAnnotations(result, b, primary);
+        return new SnipResult(result, b, primary);
+    }
+
     /// <summary>光标所在屏的 DPI(无屏则 1;退而求其次用选区中心所在屏)。</summary>
     private float DpiOf(PxPoint pt)
     {
@@ -220,6 +266,9 @@ internal sealed class OverlaySession
     {
         // M2a:指针在工具条上 = 调粗细(SPEC §9)
         if (Phase == SnipPhase.Selected && Cursor is { } c && Annot.HandleWheel(c, delta))
+            return true;
+        // §13:元素模式滚轮 = HitTest 链层级切换
+        if (Phase == SnipPhase.Hover && _elementPicker.OnWheel(delta))
             return true;
         if (_hits.Count == 0) return false;
         _hoverIndex = Math.Clamp(_hoverIndex + (delta < 0 ? 1 : -1), 0, _hits.Count - 1);
@@ -274,7 +323,13 @@ internal sealed class OverlaySession
             DpiScale: w.Display.DpiScale,
             Shapes: Annot.Document.Shapes,
             SelectedShape: Annot.Selected,
-            Toolbar: Annot.Toolbar);
+            Toolbar: Phase == SnipPhase.Selected ? Annot.Toolbar : null,
+            DraftShape: Annot.Draft,
+            TextEditing: Annot.IsTextEditing,
+            ElementHighlight: Phase == SnipPhase.Hover && _elementPicker.Mode == HitMode.Element
+                ? _elementPicker.Highlighted?.Bounds : null,
+            DetectingHint: Phase == SnipPhase.Hover && _elementPicker.Mode == HitMode.Element && _elementPicker.Detecting,
+            Whiteboard: WhiteboardMode);
     }
 
     /// <summary>

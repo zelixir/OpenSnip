@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using OpenSnip.App.CommandLine;
 using OpenSnip.App.Interop;
 using OpenSnip.Core;
@@ -18,14 +19,19 @@ public sealed class SnipService : IDisposable
     private ScreenCaptureService? _capture;     // 全 App 生命周期一份,预热后复用 DD 会话
     private SnipOverlay? _activeOverlay;
     private bool _busy;
+    private readonly HistoryStore _history;     // §19 回放帧来源(§12 历史存档)
 
     private readonly bool _testMode;            // §8.4:--test-rpc 底图注入开关
 
-    public SnipService(StaWorker sta, OutputRunner outputs, bool testMode = false)
+    /// <summary>§19 回放帧数上限(默认 10)。</summary>
+    public const int ReplayMax = 10;
+
+    public SnipService(StaWorker sta, OutputRunner outputs, bool testMode = false, HistoryStore? history = null)
     {
         _sta = sta;
         _outputs = outputs;
         _testMode = testMode;
+        _history = history ?? new HistoryStore(AppPaths.HistoryDirectory);
     }
 
     // —— 交互式截屏(F1 / 托盘 / CLI snip)——
@@ -68,7 +74,11 @@ public sealed class SnipService : IDisposable
             }
             var capture = _testMode ? null : EnsureCapture(); // §8.4:底图注入时不创建截屏服务
 
-            var overlay = new SnipOverlay(displays, display => CaptureForSnip(capture, display));
+            // §19 历史回放:读最近 N 帧(App 拥有位图,会话结束统一释放)
+            var historyFrames = LoadReplayFrames();
+            PerfLog.Log("App", $"snip:replay-frames count={historyFrames.Count} decode-total={total.Elapsed.TotalMilliseconds:F1}ms");
+
+            var overlay = new SnipOverlay(displays, display => CaptureForSnip(capture, display), historyFrames);
 
             var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             overlay.Confirmed += result =>
@@ -115,8 +125,70 @@ public sealed class SnipService : IDisposable
         finally
         {
             lock (_gate) { _activeOverlay = null; _busy = false; }
+            lock (_replayGate)
+            {
+                foreach (var f in _replayFrames)
+                {
+                    try { f.Dispose(); } catch { /* 双释放防护在 NativeBitmap 内 */ }
+                }
+                _replayFrames.Clear();
+            }
             PerfLog.Log("App", $"snip:end total={total.Elapsed.TotalMilliseconds:F1}ms");
         }
+    }
+
+    // —— §19 历史回放帧 ——
+    private readonly object _replayGate = new();
+    private readonly List<NativeBitmap> _replayFrames = new();
+
+    /// <summary>
+    /// §19:读最近 ReplayMax 帧(默认 10)并解码为 NativeBitmap(展平:单屏即帧序);
+    /// 最新历史在前(帧 1=最近一次)。并行解码,失败条目跳过。App 拥有位图,会话结束释放。
+    /// </summary>
+    private List<NativeBitmap> LoadReplayFrames()
+    {
+        var result = new List<NativeBitmap>();
+        try
+        {
+            var entries = _history.List(ReplayMax);
+            if (entries.Count == 0)
+            {
+                return result;
+            }
+            var paths = entries
+                .Select(e => System.IO.Path.Combine(_history.Directory, e.File))
+                .Where(File.Exists)
+                .ToList();
+            var decoded = new NativeBitmap?[paths.Count];
+            _ = Parallel.For(0, paths.Count, i =>
+            {
+                try
+                {
+                    using var fs = File.OpenRead(paths[i]);
+                    decoded[i] = ImageDecoder.DecodeToNativeBitmap(fs);
+                }
+                catch (Exception ex)
+                {
+                    PerfLog.Log("App", $"snip:replay-decode-failed {paths[i]} {ex.Message}");
+                }
+            });
+            foreach (var d in decoded)
+            {
+                if (d is not null)
+                {
+                    result.Add(d);
+                }
+            }
+            lock (_replayGate)
+            {
+                _replayFrames.AddRange(result); // 会话结束统一释放(§19:App 拥有)
+            }
+        }
+        catch (Exception ex)
+        {
+            PerfLog.Log("App", $"snip:replay-error {ex.Message}");
+        }
+        return result;
     }
 
     // —— 直接截取(--full / --area,无遮罩)——
@@ -258,6 +330,18 @@ public sealed class SnipService : IDisposable
         {
             return _activeOverlay;
         }
+    }
+
+    /// <summary>§19 snip.setFrame:切回放帧(0=本次 capture;透传 Overlay 封送)。无活动遮罩返回 false。</summary>
+    internal bool TryPostSetFrame(int index)
+    {
+        var overlay = TryGetActiveOverlay();
+        if (overlay is null)
+        {
+            return false;
+        }
+        overlay.PostSetFrame(index);
+        return true;
     }
 
     /// <summary>退出时若遮罩开着,强制关闭(视同取消,§2.8)。</summary>

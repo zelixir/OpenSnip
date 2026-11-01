@@ -33,6 +33,15 @@ internal sealed class AnnotationController
     public event Action? ConfirmRequested;
     public event Action? CancelRequested;
 
+    /// <summary>§14 文本编辑态:开始/停止光标闪烁定时器(由 SnipOverlay 挂 Win32 Timer)。</summary>
+    public event Action<bool>? CaretTimerRequested;
+
+    /// <summary>文本编辑进行中(光标闪烁/键入直通车)。</summary>
+    public bool IsTextEditing { get; private set; }
+
+    /// <summary>绘制/编辑中的草稿形状(未入文档;文本编辑态渲染用)。</summary>
+    public AnnotShape? Draft => _draft;
+
     private AnnotShape? _draft;
     private AnnotDragKind _drag = AnnotDragKind.None;
     private PxPoint _startPt;
@@ -62,6 +71,14 @@ internal sealed class AnnotationController
     /// <summary>按下。返回 true = 已消费(不再走 M1 路由)。</summary>
     public bool HandleMouseDown(PxPoint pt)
     {
+        // 0) §14 文本编辑中:点框外 = 提交(并继续本次点击的路由);点框内 = 继续编辑
+        if (IsTextEditing && _draft is { } ed)
+        {
+            bool inside = ed.Bounds.Contains(pt.X, pt.Y);
+            if (!inside) CommitText();
+            else return true;
+        }
+
         // 1) 工具条(最优先)
         if (Toolbar.Visible)
         {
@@ -199,6 +216,10 @@ internal sealed class AnnotationController
     /// </summary>
     public bool HandleKey(int vk, bool ctrl, bool shift)
     {
+        // §14 编辑态:Del/Ctrl+Z/Y 由文本编辑独占(Backspace 是唯一删除途径),避免栈被输入过程打穿
+        if (IsTextEditing)
+            return vk == 0x2E || (ctrl && vk is 0x5A or 0x59);
+
         switch (vk)
         {
             case 0x20: // VK_SPACE
@@ -267,6 +288,85 @@ internal sealed class AnnotationController
         }
     }
 
+    // —————————————————— §14 文本标注 ——————————————————
+
+    /// <summary>进入文本编辑态(单击创建后调用)。draft 必须是 Text 形状。</summary>
+    private void BeginTextEditing()
+    {
+        IsTextEditing = true;
+        CaretTimerRequested?.Invoke(true);
+    }
+
+    /// <summary>
+    /// §14:键入字符(WM_CHAR,含 IME 合成结果)。返回 true = 已消费。
+    /// 0x08=Backspace;0x0D/0x0A 回车由 VK_RETURN 分支处理(需区分 Shift);其余可打印字符追加。
+    /// </summary>
+    public bool HandleChar(char ch)
+    {
+        if (!IsTextEditing || _draft is not { Type: AnnotToolType.Text } s) return false;
+        if (ch == 0x08) // Backspace
+        {
+            if (s.Text is { Length: > 0 })
+            {
+                s.Text = s.Text[..^1];
+                ReflowText(s);
+            }
+            return true;
+        }
+        if (ch >= 0x20) // 可打印(含中文/IME 合成结果)
+        {
+            s.Text = (s.Text ?? string.Empty) + ch;
+            ReflowText(s);
+            return true;
+        }
+        return ch == 0x09; // Tab 在编辑态吞掉(不切模式)
+    }
+
+    /// <summary>§14:Enter=提交;Shift+Enter=换行(编辑态)。返回 true = 已消费。</summary>
+    public bool HandleTextEnterKey(bool shift)
+    {
+        if (!IsTextEditing || _draft is not { Type: AnnotToolType.Text } s) return false;
+        if (shift)
+        {
+            s.Text = (s.Text ?? string.Empty) + "\n";
+            ReflowText(s);
+        }
+        else
+        {
+            CommitText();
+        }
+        return true;
+    }
+
+    /// <summary>提交文本:空文本回滚,非空保留。结束编辑态。</summary>
+    private void CommitText()
+    {
+        IsTextEditing = false;
+        CaretTimerRequested?.Invoke(false);
+        var s = _draft;
+        _draft = null;
+        if (s is null) return;
+        if (string.IsNullOrWhiteSpace(s.Text))
+        {
+            RestoreCheckpoint(); // 空文本:回滚 checkpoint(不留空形状)
+            return;
+        }
+        if (Document.Shapes.Find(x => x.Id == s.Id) is null)
+            Document.Shapes.Add(s); // 文本流:draft 不经 CommitDraft,提交时入列表
+        Selected = null;
+    }
+
+    /// <summary>文本边界随内容增长(测量在 AnnotationRenderer.MeasureText)。</summary>
+    private void ReflowText(AnnotShape s)
+    {
+        float dpi = MathF.Max(1f, _dpi);
+        float fontSize = AnnotShape.FontSizeFromStroke(s.StrokeWidth) * dpi;
+        var (w, h) = AnnotationRenderer.MeasureText(s.Text ?? string.Empty, fontSize);
+        int x = s.Points.Count > 0 ? s.Points[0].X : s.Bounds.X;
+        int y = s.Points.Count > 0 ? s.Points[0].Y : s.Bounds.Y;
+        s.Bounds = new PxRect(x, y, Math.Max((int)w, (int)(fontSize * 0.8f)), Math.Max((int)h, (int)fontSize));
+    }
+
     private void UpdateDraft(PxPoint ptRaw)
     {
         var s = _draft!;
@@ -308,6 +408,19 @@ internal sealed class AnnotationController
             // 二次编辑重画:形状已在文档中,几何已更新
             if (tinyMove) RestoreCheckpoint(); // 无效重画(单击):回滚
             return;
+        }
+
+        if (_drag == AnnotDragKind.Draw && s.Type == AnnotToolType.Text)
+        {
+            // §14 文本:单击创建空框 → 进入编辑态(键入,Enter/点外提交)
+            if (tinyMove)
+            {
+                s.Text = string.Empty; // 起点已在 BeginDraft 加入 Points[0]
+                ReflowText(s);
+                BeginTextEditing();
+                return;
+            }
+            // 拖拽出框(非标准用法):按普通形状提交
         }
 
         if (tinyMove)
