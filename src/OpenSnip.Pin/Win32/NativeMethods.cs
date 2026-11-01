@@ -36,6 +36,7 @@ internal static unsafe class NativeMethods
     internal const uint WM_RBUTTONUP = 0x0205u;
     internal const uint WM_MOUSEWHEEL = 0x020Au;
     internal const uint WM_APP = 0x8000u;
+    internal const uint WM_TIMER = 0x0113u;
 
     /// <summary>调度唤醒消息:贴图线程收到后排空工作队列。</summary>
     internal const uint WM_APP_DISPATCH = WM_APP + 1;
@@ -65,11 +66,15 @@ internal static unsafe class NativeMethods
     internal const uint MF_STRING = 0x0000u;
     internal const uint MF_CHECKED = 0x0008u;
     internal const uint MF_SEPARATOR = 0x0800u;
+    internal const uint MF_POPUP = 0x0010u;
 
     /// <summary>右键菜单命令 ID(仅内部;M2 可扩展"保存为 PNG")。</summary>
     internal const uint MENU_ID_TOPMOST = 1;
     internal const uint MENU_ID_CLICKTHROUGH = 2;
     internal const uint MENU_ID_CLOSE = 3;
+
+    /// <summary>背景模式子菜单首 ID:FIRST+n,n=0..3 依次对应 PinBackground 四模式(契约 §11)。</summary>
+    internal const uint MENU_ID_BG_FIRST = 0x10u;
 
     internal const int GWL_STYLE = -16;
     internal const int GWL_EXSTYLE = -20;
@@ -246,6 +251,12 @@ internal static unsafe class NativeMethods
 
     [DllImport("user32.dll")]
     internal static extern IntPtr LoadCursorW(IntPtr hInstance, uint lpCursorName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern IntPtr SetTimer(IntPtr hWnd, IntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool KillTimer(IntPtr hWnd, IntPtr nIDEvent);
 
     // ===== API:gdi32 =====
 

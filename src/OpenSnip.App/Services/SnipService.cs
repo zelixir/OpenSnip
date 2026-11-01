@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using OpenSnip.App.CommandLine;
+using OpenSnip.App.Interop;
 using OpenSnip.Core;
 using OpenSnip.Overlay;
 
@@ -43,11 +44,13 @@ public sealed class SnipService : IDisposable
             _busy = true;
         }
         PerfLog.Log("App", $"snip:interactive-begin trigger={trigger} t={AppClock.ElapsedMs}ms");
-        return Task.Run(() => RunInteractiveAsync(trigger, targets, delaySeconds));
+        var metaCtx = NativeMethods.GetForegroundContext(); // §12:截屏瞬间前台窗口($title$/$exe$)
+        var meta = new SnipMeta(metaCtx.Title, metaCtx.Exe);
+        return Task.Run(() => RunInteractiveAsync(trigger, targets, delaySeconds, meta));
     }
 
     private async Task<(bool Ok, string? Error)> RunInteractiveAsync(
-        string trigger, IReadOnlyList<OutputTarget> targets, double delaySeconds)
+        string trigger, IReadOnlyList<OutputTarget> targets, double delaySeconds, SnipMeta meta)
     {
         var total = Stopwatch.StartNew();
         try
@@ -74,7 +77,7 @@ public sealed class SnipService : IDisposable
                 {
                     PerfLog.Log("App", $"snip:confirmed rect={result.PhysicalRect.X},{result.PhysicalRect.Y} {result.PhysicalRect.Width}x{result.PhysicalRect.Height} display={result.Display.Index} total={total.Elapsed.TotalMilliseconds:F1}ms");
                     // 选区来源 ⇒ 贴回原位(result.PhysicalRect);pin 存在则所有权转移给 PinWindow(§2.9)
-                    bool pinned = _outputs.Run(result.Image, result.PhysicalRect, targets);
+                    bool pinned = _outputs.Run(result.Image, result.PhysicalRect, targets, meta);
                     if (!pinned)
                     {
                         result.Image.Dispose(); // 无 pin 输出:App 负责释放
@@ -120,10 +123,14 @@ public sealed class SnipService : IDisposable
 
     public Task<(bool Ok, string? Error)> CaptureDirectAsync(
         SnipMode mode, int x, int y, int w, int h, IReadOnlyList<OutputTarget> targets, double delaySeconds)
-        => Task.Run(() => RunDirect(mode, x, y, w, h, targets, delaySeconds));
+    {
+        var metaCtx = NativeMethods.GetForegroundContext();
+        var meta = new SnipMeta(metaCtx.Title, metaCtx.Exe);
+        return Task.Run(() => RunDirect(mode, x, y, w, h, targets, delaySeconds, meta));
+    }
 
     private (bool Ok, string? Error) RunDirect(
-        SnipMode mode, int x, int y, int w, int h, IReadOnlyList<OutputTarget> targets, double delaySeconds)
+        SnipMode mode, int x, int y, int w, int h, IReadOnlyList<OutputTarget> targets, double delaySeconds, SnipMeta meta)
     {
         var total = Stopwatch.StartNew();
         try
@@ -192,7 +199,7 @@ public sealed class SnipService : IDisposable
                 outRect = clip;
             }
 
-            bool pinned = _outputs.Run(image, outRect, targets);
+            bool pinned = _outputs.Run(image, outRect, targets, meta);
             if (!pinned)
             {
                 image.Dispose();

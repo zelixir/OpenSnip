@@ -697,6 +697,19 @@ try {
   }
   Add-Step 'snip.output.file' $true ("存在、$($RegionW)x$($RegionH)、与源底图选区区域逐点一致(采样 $($crop.Sampled) 点, 容差 12)")
 
+  # ---------- history.list(SPEC §12: 历史入档)----------
+  $hl = Invoke-TestRpc -Payload @{ cmd = 'history.list' }
+  if (-not (Get-Prop $hl 'ok')) {
+    Add-Step 'history.list' $false -Soft ('history.list 响应非 ok(协议未实现?): ' + (ConvertTo-Json -Compress -InputObject $hl -Depth 5))
+  } else {
+    $hlTotal = [int](Get-Prop $hl 'total')
+    if ($hlTotal -lt 1) {
+      Save-FailureScene '历史未入档'
+      Fail-Fast 'history.list' ("成功截图后 history.total=$hlTotal(<1)——历史入档缺陷")
+    }
+    Add-Step 'history.list' $true "total=$hlTotal, 最近一条已入档"
+  }
+
   # ---------- clipboard.preset(独立 STA 进程,256x256 渐变) ----------
   $clipChild = Join-Path $ArtDir 'preset-clipboard-child.ps1'
   $clipPng   = Join-Path $ArtDir 'clipboard-source.png'
@@ -799,6 +812,16 @@ exit 0
   }
   if (-not $closed) { Fail-Fast 'pin.closeAll' 'closeAll ok 但 10s 内 pins 未归零' }
   Add-Step 'pin.closeAll' $true 'closeAll ok; status.pins=0'
+
+  # ---------- corners.set(SPEC §12: 触发角开关往返)----------
+  $c1 = Invoke-TestRpc -Payload @{ cmd = 'corners.set'; enabled = $false }
+  if (-not (Get-Prop $c1 'ok')) {
+    Add-Step 'corners.set' $false -Soft ('corners.set 响应非 ok(协议未实现?): ' + (ConvertTo-Json -Compress -InputObject $c1 -Depth 5))
+  } else {
+    $c2 = Invoke-TestRpc -Payload @{ cmd = 'corners.set'; enabled = $true }
+    if (-not (Get-Prop $c2 'ok')) { Add-Step 'corners.set' $false -Soft '第二轮 enabled=true 非 ok' }
+    else { Add-Step 'corners.set' $true 'false→true 往返 ok(触发角开关链路通)' }
+  }
 
   # ---------- app.exit(探测扩展命令,回退 vdesk kill) ----------
   $exitNote = ''

@@ -2,8 +2,8 @@ using System.Globalization;
 
 namespace OpenSnip.App.CommandLine;
 
-/// <summary>顶层命令(SPEC §3.4:snip / paste / exit)。</summary>
-public enum CliCommandKind { None, Snip, Paste, Exit }
+/// <summary>顶层命令(SPEC §3.4:snip / paste / exit;§12:history)。</summary>
+public enum CliCommandKind { None, Snip, Paste, Exit, History }
 
 /// <summary>snip 的取图方式:交互遮罩 / 全屏直截 / 指定矩形直截。</summary>
 public enum SnipMode { Interactive, Full, Area }
@@ -24,12 +24,13 @@ public sealed record CliOptions(
     SnipMode Mode,
     int AreaX, int AreaY, int AreaW, int AreaH,
     double DelaySeconds,
+    int HistoryCount,
     IReadOnlyList<OutputTarget> Outputs,
     bool HasExplicitOutputs)
 {
     public static CliOptions Fail(string error) => new(
         Ok: false, Error: error, Block: false, TestRpc: false, CliCommandKind.None, SnipMode.Interactive,
-        0, 0, 0, 0, 0, Array.Empty<OutputTarget>(), HasExplicitOutputs: false);
+        0, 0, 0, 0, 0, 10, Array.Empty<OutputTarget>(), HasExplicitOutputs: false);
 }
 
 /// <summary>
@@ -66,6 +67,7 @@ public static class CommandLineParser
             bool explicitOutputs = false;
             bool block = false;
             bool testRpc = false;
+            int historyCount = 10; // §12:history [N] 默认 10
 
             for (int i = 0; i < args.Count; i++)
             {
@@ -93,6 +95,16 @@ public static class CommandLineParser
                     case "exit":
                         if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
                         command = CliCommandKind.Exit;
+                        break;
+                    case "history": // §12:history [N] — 列出最近 N 条历史(默认 10)
+                        if (command != CliCommandKind.None) return CliOptions.Fail($"命令重复:{tok}");
+                        command = CliCommandKind.History;
+                        if (i + 1 < args.Count && int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var hc)
+                            && hc > 0 && hc <= 100)
+                        {
+                            historyCount = hc;
+                            i += 1;
+                        }
                         break;
                     case "--full":
                     {
@@ -143,7 +155,7 @@ public static class CommandLineParser
                         return CliOptions.Fail(tok.StartsWith('-') ? $"未知选项:{tok}" : $"无法识别的参数:{tok}");
                 }
             }
-            return new CliOptions(true, null, block, testRpc, command, mode, ax, ay, aw, ah, delay, outputs, explicitOutputs);
+            return new CliOptions(true, null, block, testRpc, command, mode, ax, ay, aw, ah, delay, historyCount, outputs, explicitOutputs);
         }
         catch (Exception ex)
         {

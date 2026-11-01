@@ -58,6 +58,11 @@ internal static class Win32
 
     // 虚拟键
     public const int VK_SHIFT = 0x10;
+    public const int VK_CONTROL = 0x11;
+    public const int VK_DELETE = 0x2E;
+    public const int VK_SPACE = 0x20;
+    public const int VK_OEM_COMMA = 0xBC;
+    public const int VK_OEM_PERIOD = 0xBE;
     public const int VK_RETURN = 0x0D;
     public const int VK_ESCAPE = 0x1B;
     public const int VK_LEFT = 0x25;

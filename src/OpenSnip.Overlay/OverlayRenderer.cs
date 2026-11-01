@@ -4,6 +4,7 @@
 // 性能要点:每帧全窗口写只有两遍(冻结 blit + Src 模式遮罩矩形),
 // 遮罩用 SKBlendMode.Src 直接替换背衬内容,同时承担清屏职责,无独立 Clear 遍。
 using OpenSnip.Core;
+using OpenSnip.Overlay.Annotation;
 using SkiaSharp;
 
 namespace OpenSnip.Overlay;
@@ -19,7 +20,10 @@ internal readonly record struct RenderModel(
     PxPoint? CursorPt,          // 光标虚拟物理坐标(未知时 null)
     string? MagnifierHex,       // 放大镜中心像素 "#RRGGBB"(不可得时 null)
     bool ShowMagnifier,
-    float DpiScale);
+    float DpiScale,
+    System.Collections.Generic.IReadOnlyList<AnnotShape>? Shapes = null, // §9 标注(空文档传空表即可)
+    AnnotShape? SelectedShape = null,                                    // 选中态(高亮框+8 锚点)
+    AnnotToolbar? Toolbar = null);                                           // 工具条(Visible 由对象决定)
 
 /// <summary>绘制器本身无状态(画笔缓存在实例上,仅 Overlay UI 线程使用)。</summary>
 internal sealed class OverlayRenderer
@@ -126,6 +130,10 @@ internal sealed class OverlayRenderer
             canvas.Clear(SKColors.Transparent); // 无画面兜底:罕见路径,不追求零成本
         }
 
+        // 1.5) 标注(SPEC §9:画于冻结画面之上、遮罩之下;标注限定选区内,选区内无遮罩)
+        if (m.Shapes is { Count: > 0 })
+            AnnotationRenderer.Draw(canvas, m.Shapes, m.Frozen, m.SelectedShape, m.WindowOrigin, m.DpiScale);
+
         // 2) 遮罩(SrcOver 叠加):有选区 → "回"形四矩形(选区内全亮);无选区 → 全屏 50%
         if (m.Selection is { } sel)
         {
@@ -151,13 +159,18 @@ internal sealed class OverlayRenderer
                 DrawHighlight(canvas, m, hl);
         }
 
-        // 4) 十字准线(全屏 1px 半透明白)
-        if (m.CursorPt is { } cur)
+        // 4) 十字准线(全屏 1px 半透明白;标注工具条可见时抑制,避免穿过标注)
+        bool annotateMode = m.Toolbar is { Visible: true };
+        if (!annotateMode && m.CursorPt is { } cur)
             DrawCrosshair(canvas, m, cur);
 
-        // 5) 放大镜(拖拽中隐藏)
-        if (m.ShowMagnifier && m.CursorPt is { } cur2)
+        // 5) 放大镜(拖拽中隐藏;标注模式不画,工具条在附近)
+        if (!annotateMode && m.ShowMagnifier && m.CursorPt is { } cur2)
             DrawMagnifier(canvas, m, cur2);
+
+        // 6) 工具条(最顶 UI,§9)
+        if (annotateMode)
+            AnnotationRenderer.DrawToolbar(canvas, m.Toolbar!, m.WindowOrigin, m.CursorPt, m.DpiScale);
 
         canvas.Flush();
     }

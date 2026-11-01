@@ -6,6 +6,7 @@ namespace OpenSnip.Pin;
 /// 贴图窗口呈现目标:一块与内容等大的 32bpp top-down DIBSection。
 /// Skia 直接把像素画进 DIB 内存(预乘 BGRA,即 ULW 要求的格式),
 /// 再经 UpdateLayeredWindow(ULW_ALPHA)提交到分层窗口(契约 §3.3"Skia 画进 ULW DIB")。
+/// M2a(§11):支持背景层(伪透明快照/棋盘格)与瞬隐帧(伪透明重截前防止把贴图自己截进背景)。
 /// 仅允许在贴图线程使用。
 /// </summary>
 internal sealed class PinRenderTarget : IDisposable
@@ -69,7 +70,7 @@ internal sealed class PinRenderTarget : IDisposable
             _memDc, ref info, NativeMethods.DIB_RGB_COLORS, out IntPtr bits, IntPtr.Zero, 0);
         if (dib == IntPtr.Zero || bits == IntPtr.Zero)
         {
-            throw new OutOfMemoryException($"CreateDIBSection 失败 ({width}x{height})");
+            throw new OutOfMemoryException("CreateDIBSection 失败 (" + width + "x" + height + ")");
         }
 
         if (_defaultBmp == IntPtr.Zero)
@@ -98,12 +99,13 @@ internal sealed class PinRenderTarget : IDisposable
     }
 
     /// <summary>
-    /// 把内容位图画进 DIB 并 ULW 提交到窗口。content 须为预乘 BGRA32、尺寸与 DIB 一致(不一致时先重建 DIB)。
-    /// opacityPercent ∈ [10,100]:以颜色矩阵把预乘像素整体按比例衰减,
-    /// 视觉效果与 LWA_ALPHA 等价。为何不走 LWA_ALPHA:Win32 规定 SetLayeredWindowAttributes 与
-    /// UpdateLayeredWindow 在同一窗口上互斥(先 ULW 后 LWA 失败),故按契约 ULW 通道内实现(见交付报告)。
+    /// 把内容位图画进 DIB 并 ULW 提交到窗口。content 须为预乘 BGRA32。
+    /// background(契约 §11 背景层):伪透明快照或棋盘格,须与窗口同尺寸(1:1 直接铺底,不重采样);
+    /// 传入时窗口整体不透明(alpha=255 整块可命中);null 时保持 M1 逐像素 alpha 行为。
+    /// opacityPercent ∈ [10,100]:以颜色矩阵把内容层预乘像素整体按比例衰减(与 LWA_ALPHA 等价;
+    /// 不作用于背景层 —— 伪透明下"背景恒清晰、内容随透明度淡出",符合直觉)。
     /// </summary>
-    public unsafe bool Commit(IntPtr hwnd, int x, int y, SKBitmap content, byte opacityPercent)
+    public unsafe bool Commit(IntPtr hwnd, int x, int y, SKBitmap content, byte opacityPercent, SKBitmap? background = null)
     {
         EnsureSize(content.Width, content.Height);
         if (_skiaWrapper is null)
@@ -114,6 +116,10 @@ internal sealed class PinRenderTarget : IDisposable
         using (var canvas = new SKCanvas(_skiaWrapper))
         {
             canvas.Clear(SKColors.Transparent);
+            if (background is not null && background.Width == _width && background.Height == _height)
+            {
+                canvas.DrawBitmap(background, 0f, 0f, SKSamplingOptions.Default, paint: null);   // 背景层铺底
+            }
             using var paint = new SKPaint();
             if (opacityPercent < 100)
             {
@@ -124,7 +130,26 @@ internal sealed class PinRenderTarget : IDisposable
             canvas.Flush();
         }
 
-        // UpdateLayeredWindow:dst = 窗口左上(屏幕物理坐标),src = (0,0)
+        return SubmitUlW(hwnd, x, y);
+    }
+
+    /// <summary>
+    /// 提交全透明帧(窗口视觉消失一瞬)。伪透明重截前使用:贴图先从屏幕上"拿开",
+    /// 截屏才不会把贴图自己截进背景。调用方需在截屏后立即恢复 Commit。
+    /// </summary>
+    internal unsafe bool CommitTransparentFrame(IntPtr hwnd, int x, int y)
+    {
+        if (_dibBits == IntPtr.Zero || _width <= 0 || _height <= 0)
+        {
+            return false;
+        }
+        new Span<byte>((void*)_dibBits, _width * _height * 4).Clear();
+        return SubmitUlW(hwnd, x, y);
+    }
+
+    /// <summary>ULW 提交(共用):dst = 窗口左上(屏幕物理坐标),src = (0,0)。</summary>
+    private unsafe bool SubmitUlW(IntPtr hwnd, int x, int y)
+    {
         var blend = new NativeMethods.BLENDFUNCTION
         {
             BlendOp = NativeMethods.AC_SRC_OVER,
@@ -171,15 +196,14 @@ internal sealed class PinRenderTarget : IDisposable
 }
 
 /// <summary>
-/// Skia 合成辅助:重采样与透明度颜色矩阵。
-/// 契约 §3.3:缩放走位图重采样(SKBitmap.Resize,quality mipmap)。
+/// Skia 合成辅助:重采样、透明度颜色矩阵与棋盘生成。
+/// 契约 §3.3:缩放走位图重采样(quality mipmap);§11:棋盘背景生成。
 /// </summary>
 internal static class PinRenderer
 {
     /// <summary>
     /// mipmap 采样(线性过滤 + 线性 mip 链;契约 §3.3 "quality mipmap")。
-    /// SkiaSharp 4.x 已移除 SKFilterQuality/legacy 采样,此为官方等价新 API;
-    /// 大倍率缩小时走 mip 链,无摩尔纹。
+    /// SkiaSharp 4.x 已移除 SKFilterQuality/legacy 采样,此为官方等价新 API。
     /// </summary>
     internal static readonly SKSamplingOptions MipmapSampling = new(SKFilterMode.Linear, SKMipmapMode.Linear);
     internal static readonly SKSamplingOptions LinearSampling = new(SKFilterMode.Linear);
@@ -215,8 +239,7 @@ internal static class PinRenderer
 
     /// <summary>
     /// 从基准位图重采样出目标尺寸的预乘 BGRA 位图。
-    /// 缩小走 mipmap(契约 §3.3 "quality mipmap";大倍率缩小无摩尔纹),
-    /// 放大走纯线性(mipmap 对放大无意义,Skia 会拒绝该组合)。
+    /// 缩小走 mipmap(契约 §3.3;大倍率缩小无摩尔纹),放大走纯线性(mipmap 对放大无意义,Skia 会拒绝该组合);
     /// mipmap 组合被运行时拒绝时的兜底:高质量三次采样(Mitchell)。
     /// 失败返回 null,调用方沿用旧内容(下一格滚轮再试),不冲垮交互。
     /// </summary>
@@ -249,5 +272,35 @@ internal static class PinRenderer
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// 生成不透明棋盘格背景(契约 §11:深/浅棋盘;浅棋盘同时是伪透明的回退背景)。
+    /// 格边长 8×DpiScale 物理像素;深色 #2B2B2B/#3C3C3C,浅色 #FFFFFF/#C8C8C8。
+    /// </summary>
+    internal static SKBitmap BuildCheckerboard(bool dark, int width, int height, float dpiScale)
+    {
+        int cell = Math.Max(4, (int)Math.Round(8 * dpiScale));
+        SKColor baseColor = dark ? new SKColor(0x2B, 0x2B, 0x2B) : SKColors.White;
+        SKColor altColor = dark ? new SKColor(0x3C, 0x3C, 0x3C) : new SKColor(0xC8, 0xC8, 0xC8);
+
+        var dst = new SKBitmap(new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+        using (var canvas = new SKCanvas(dst))
+        {
+            using (var basePaint = new SKPaint { Color = baseColor })
+            {
+                canvas.Clear(baseColor);
+            }
+            using var altPaint = new SKPaint { Color = altColor };
+            for (int y = 0, row = 0; y < height; y += cell, row++)
+            {
+                for (int x = (row & 1) * cell; x < width; x += cell * 2)
+                {
+                    canvas.DrawRect(x, y, cell, cell, altPaint);
+                }
+            }
+            canvas.Flush();
+        }
+        return dst;
     }
 }

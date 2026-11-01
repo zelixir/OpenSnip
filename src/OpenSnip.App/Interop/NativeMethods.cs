@@ -52,6 +52,31 @@ internal static class NativeMethods
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     public static extern uint DragQueryFileW(IntPtr hDrop, uint iFile, StringBuilder? lpszFile, uint cch);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    /// <summary>截屏瞬间的前台窗口上下文(§12 $title$/$exe$ 与历史元数据)。</summary>
+    public static (string Title, string Exe) GetForegroundContext()
+    {
+        var hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero)
+        {
+            return ("", "");
+        }
+        var sb = new StringBuilder(512);
+        _ = GetWindowTextW(hwnd, sb, sb.Capacity);
+        var exe = "";
+        if (GetWindowThreadProcessId(hwnd, out var pid) != 0)
+        {
+            try { exe = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; }
+            catch { /* 进程已退出/权限不足:留空 */ }
+        }
+        return (sb.ToString(), exe);
+    }
+
     // —— 本进程顶层窗口枚举(§8.2 status:遮罩/贴图 hwnd 反查)——
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);

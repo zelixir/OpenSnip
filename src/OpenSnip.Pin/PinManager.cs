@@ -5,12 +5,17 @@ namespace OpenSnip.Pin;
 /// <summary>
 /// 贴图管理器(契约 §2.9):单 STA 消息循环线程托管全部贴图窗口。
 /// <see cref="Pin"/> 可在任意线程调用,内部经队列投递到贴图线程同步创建(返回时窗口已建成并完成首帧提交)。
+/// M2a(§11):新增虚拟桌面归属只读查询;并持有伪透明背景所需的截屏服务。
 /// </summary>
 public static class PinManager
 {
     private static readonly object Gate = new();
     private static PinDispatcher? _dispatcher;
     private static readonly List<PinWindow> Pins = new();
+
+    private static readonly object CaptureGate = new();
+    private static ScreenCaptureService? _capture;      // 伪透明背景截屏服务(懒加载)
+    private static bool _captureCreateFailed;           // 构造失败后不再反复重试
 
     /// <summary>
     /// 创建贴图窗口并显示(同步)。
@@ -74,7 +79,18 @@ public static class PinManager
         }
     }
 
-    /// <summary>关闭全部贴图窗口并停止贴图线程;之后可再次 Pin(按需重启线程)。</summary>
+    /// <summary>
+    /// 贴图窗口是否位于当前虚拟桌面(IVirtualDesktopManager COM,v1 只读;契约 §11)。线程安全。
+    /// 失败语义(有意保守):窗口已销毁/句柄无效 → false;COM 不可用或查询失败 → true
+    /// (当作"在当前桌面",避免调用方据此隐藏贴图时误伤)。本方法不抛异常。
+    /// </summary>
+    public static bool IsOnCurrentVirtualDesktop(PinWindow window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        return VirtualDesktopHelper.IsOnCurrentVirtualDesktop(window.GetLiveHwnd());
+    }
+
+    /// <summary>关闭全部贴图窗口并停止贴图线程;之后可再次 Pin(按需重启线程与截屏服务)。</summary>
     public static void Shutdown()
     {
         PinDispatcher? dispatcher;
@@ -120,6 +136,13 @@ public static class PinManager
                     _dispatcher = null;
                 }
             }
+            // 截屏服务(含 D3D 设备/DD 会话)随 Shutdown 一并释放,下次 Pin 重新懒加载
+            lock (CaptureGate)
+            {
+                _capture?.Dispose();
+                _capture = null;
+                _captureCreateFailed = false;
+            }
         }
     }
 
@@ -135,6 +158,36 @@ public static class PinManager
             var d = new PinDispatcher();
             _dispatcher = d;
             return d;
+        }
+    }
+
+    /// <summary>
+    /// 伪透明背景截屏服务(懒加载;构造失败返回 null 并 PerfLog,不再重试直至 Shutdown 复位)。
+    /// 仅在贴图线程使用(ScreenCaptureService 非线程安全)。
+    /// </summary>
+    internal static ScreenCaptureService? EnsureCaptureService()
+    {
+        lock (CaptureGate)
+        {
+            if (_captureCreateFailed)
+            {
+                return null;
+            }
+            if (_capture is not null)
+            {
+                return _capture;
+            }
+            try
+            {
+                _capture = new ScreenCaptureService();
+                return _capture;
+            }
+            catch (Exception ex)
+            {
+                _captureCreateFailed = true;
+                PerfLog.Log("Pin", "capture-service create failed: " + ex.Message);
+                return null;
+            }
         }
     }
 

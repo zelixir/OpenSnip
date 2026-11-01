@@ -23,6 +23,8 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
     private readonly Stopwatch _startSw = new();
 
     private OverlaySession? _session;
+    private readonly IReadOnlyList<NativeBitmap>? _historyFrames; // §9 回放:历史帧(App 拥有,Overlay 不 Dispose)
+    private int _frameIndex;                                      // 0 = 当前 capture 帧
     private Thread? _thread;
     private volatile bool _closeRequested;
     private bool _confirmed;
@@ -37,9 +39,20 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
     public event Action? Cancelled;
 
     public SnipOverlay(IReadOnlyList<DisplayInfo> displays, Func<DisplayInfo, NativeBitmap> capture)
+        : this(displays, capture, null)
+    {
+    }
+
+    /// <summary>
+    /// §9 回放钩子:historyFrames 为历史帧(每帧按 displays 顺序展平;缺省 null = 无回放)。
+    /// 列表由调用方(App)拥有,Overlay 不负责 Dispose。
+    /// </summary>
+    public SnipOverlay(IReadOnlyList<DisplayInfo> displays, Func<DisplayInfo, NativeBitmap> capture,
+        IReadOnlyList<NativeBitmap>? historyFrames)
     {
         _displays = displays ?? throw new ArgumentNullException(nameof(displays));
         _capture = capture ?? throw new ArgumentNullException(nameof(capture));
+        _historyFrames = historyFrames;
         if (_displays.Count == 0) throw new ArgumentException("displays 不能为空", nameof(displays));
     }
 
@@ -187,7 +200,11 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
             }
             if (_closeRequested && _windows.Count == 0) return;
 
-            _session = new OverlaySession(_displays, _frozen, _selfHwnds);
+            _session = new OverlaySession(_displays, _frozen, _selfHwnds,
+                d => _windows.Find(w => w.Display.Index == d.Index)?.FrozenImage);
+            // §9 工具条按钮:确认/取消(等价 Enter/Esc)
+            _session.Annot.ConfirmRequested += () => ConfirmAndExit();
+            _session.Annot.CancelRequested += () => NativeMethods.PostQuitMessage(0);
 
             // 初始光标位置(避免首帧无准线/无高亮)
             if (NativeMethods.GetCursorPos(out var cp))
@@ -420,6 +437,21 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
 
     private void HandleKey(int vk)
     {
+        bool ctrl = (NativeMethods.GetKeyState(Win32.VK_CONTROL) & 0x8000) != 0;
+        bool shift = (NativeMethods.GetKeyState(Win32.VK_SHIFT) & 0x8000) != 0;
+        var sess = _session;
+
+        // §9 标注键(Del/Ctrl+Z/Ctrl+Y/Ctrl+Shift+Z/空格)——仅标注相位消费
+        if (sess is not null && sess.Phase == SnipPhase.Selected && sess.Annot.HandleKey(vk, ctrl, shift))
+        {
+            RenderAll();
+            return;
+        }
+
+        // §9 回放:逗号/句号循环切换冻结帧
+        if (vk == Win32.VK_OEM_COMMA) { SwitchFrame(-1); return; }
+        if (vk == Win32.VK_OEM_PERIOD) { SwitchFrame(1); return; }
+
         switch (vk)
         {
             case Win32.VK_ESCAPE:
@@ -441,6 +473,48 @@ public sealed class SnipOverlay : IDisposable, IOverlayMessageSink
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// §9 回放:逗号/句号循环切换冻结帧。
+    /// 帧 0 = 当前 capture 帧;1..n = historyFrames(按 displays 顺序展平,第 k 帧第 d 屏
+    /// = historyFrames[(k-1)*displays.Count + d])。标注保留(与帧无关的视觉叠加)。
+    /// </summary>
+    private void SwitchFrame(int dir)
+    {
+        var frames = _historyFrames;
+        if (frames is not { Count: > 0 }) return;
+        int perFrame = Math.Max(1, _displays.Count);
+        int total = 1 + (frames.Count + perFrame - 1) / perFrame;
+        _frameIndex = ((_frameIndex + dir) % total + total) % total;
+        foreach (var w in _windows)
+        {
+            try
+            {
+                if (_frameIndex == 0)
+                {
+                    if (_frozen.TryGetValue(w.Display.Index, out var cap) && cap is not null)
+                        w.SetFrozen(cap); // 回当前帧(重建 premul 转存,一次性成本可接受)
+                }
+                else
+                {
+                    int idx = (_frameIndex - 1) * perFrame + w.Display.Index;
+                    if (idx < frames.Count)
+                    {
+                        var fb = frames[idx];
+                        EnsureOpaque(fb);
+                        w.SetFrozen(fb);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PerfLog.Log("Overlay.Frame", $"switchFrame display={w.Display.Index} FAILED: {ex.Message}");
+            }
+        }
+        _session?.Annot.OnFrameSwitched(_frameIndex);
+        RenderAll();
+        PerfLog.Log("Overlay.Frame", $"historyFrame index={_frameIndex}/{total}");
     }
 
     /// <summary>确认:裁剪(PerfLog 打点)→ 隐藏窗口 → 触发 Confirmed(内部线程)→ 退出循环。</summary>

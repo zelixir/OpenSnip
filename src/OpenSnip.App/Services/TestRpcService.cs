@@ -33,6 +33,8 @@ public sealed class TestRpcService : IAsyncDisposable
     private readonly PinRegistry _pins;
     private readonly Func<bool> _trayReady;
     private readonly Func<(bool Ok, string? Error)> _paste;
+    private readonly HistoryStore _history;
+    private readonly Func<bool, (bool Ok, string? Error)> _cornerSet;
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -41,13 +43,17 @@ public sealed class TestRpcService : IAsyncDisposable
         Func<SnipOverlay?> activeOverlay,
         PinRegistry pins,
         Func<bool> trayReady,
-        Func<(bool Ok, string? Error)> paste)
+        Func<(bool Ok, string? Error)> paste,
+        HistoryStore history,
+        Func<bool, (bool Ok, string? Error)> cornerSet)
     {
         _startSnip = startSnip;
         _activeOverlay = activeOverlay;
         _pins = pins;
         _trayReady = trayReady;
         _paste = paste;
+        _history = history;
+        _cornerSet = cornerSet;
     }
 
     public void Start()
@@ -170,6 +176,38 @@ public sealed class TestRpcService : IAsyncDisposable
             }
             case "overlay.snapshot":
                 return OverlaySnapshot(root);
+            case "history.list": // §12:历史列表 {count?:N} → {ok,total,count,items[]}
+            {
+                int count = 10;
+                if (root.TryGetProperty("count", out var cEl) && cEl.ValueKind == JsonValueKind.Number && cEl.TryGetInt32(out var cv))
+                {
+                    count = Math.Clamp(cv, 0, 100);
+                }
+                var items = _history.List(count);
+                var arr = new List<object?>(items.Count);
+                foreach (var e in items)
+                {
+                    arr.Add(new Dictionary<string, object?>
+                    {
+                        ["file"] = e.File, ["time"] = e.Time, ["w"] = e.W, ["h"] = e.H,
+                        ["title"] = e.Title, ["exe"] = e.Exe,
+                    });
+                }
+                return JsonSerializer.Serialize(new Dictionary<string, object?>
+                {
+                    ["ok"] = true, ["total"] = _history.Total, ["count"] = items.Count, ["items"] = arr,
+                }, JsonOpts);
+            }
+            case "corners.set": // §12:触发角运行时开关 {enabled:bool}
+            {
+                if (!root.TryGetProperty("enabled", out var en)
+                    || (en.ValueKind != JsonValueKind.True && en.ValueKind != JsonValueKind.False))
+                {
+                    return Err("corners.set 需要布尔 enabled");
+                }
+                var (ok, msg) = _cornerSet(en.GetBoolean());
+                return ok ? Ok() : Err(msg ?? "触发角开关失败");
+            }
             default:
                 return Err($"未知命令:{cmdEl.GetString()}");
         }

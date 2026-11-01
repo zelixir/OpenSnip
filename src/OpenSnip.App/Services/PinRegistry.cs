@@ -50,6 +50,21 @@ public sealed class PinRegistry
         return n;
     }
 
+    /// <summary>
+    /// §12 触发角 show-images/hide-images 的 v1 实现:统一调整全部贴图不透明度
+    /// (显示=100,隐藏=10;PinWindow 契约最低 10)。返回成功设置的数量。
+    /// </summary>
+    public int SetPinsOpacityAll(byte opacity)
+    {
+        int n = 0;
+        foreach (var kv in _pins)
+        {
+            try { kv.Key.OpacityPercent = opacity; n++; }
+            catch (Exception ex) { PerfLog.Log("App", $"pins:opacity-failed {ex.Message}"); }
+        }
+        return n;
+    }
+
     /// <summary>status.pins 快照:hwnd 十进制字符串、rect=[x,y,w,h]、topmost/opacity/clickThrough(§8.2)。</summary>
     public List<Dictionary<string, object?>> Snapshot()
     {

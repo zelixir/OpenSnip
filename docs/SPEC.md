@@ -327,3 +327,59 @@ public sealed class SnipOverlay {
 ### 8.5 PrintWindow 隐藏桌面限制与 overlay.snapshot(2026-10-31 实证裁决 #2)
 - **实证**:vdesk shot 的 PW_RENDERFULLCONTENT 依赖 DWM 合成,而**隐藏桌面窗口不进 DWM 合成树** → 隐藏桌面下遮罩 shot 全黑与窗口实际内容无关(perf.log 已证 TEST-PATTERN 生成 + FirstFrame draw+ULW=18.98ms 提交成功)。PrintWindow 在隐藏桌面为 best-effort,E2E 中降级为 warn 不 fail。
 - **替代强断言:RPC 新命令 `{"cmd":"overlay.snapshot","out":"PNG路径"}`** —— 进程内把活动遮罩窗口的渲染 DIB 直接编码导出(与 ULW 提交同一块内存),返回 `{"ok":true,"w":N,"h":N}`;无活动遮罩返回 ok:false。E2E 的遮罩渲染断言(色带/选区框/锚点)全部基于 snapshot 的 PNG,PrintWindow 结果仅作参考记录。
+
+---
+
+# M2a 契约增补(标注引擎 / 元素检测 / 贴图进阶 / 历史与触发角)
+
+> 四线并行,文件域互斥:Overlay=标注、Core=元素检测+触发角、Pin=背景模式/虚拟桌面、App=历史/命名/自动保存。
+> 原红线全部有效;新增:UIA 调用必须异常+超时隔离(目标程序 UIA 崩溃不得带崩 OpenSnip);标注对象全部 POCO 可序列化(为保存/剪贴板预留)。
+
+## 9. 标注引擎(Overlay)[owner: overlay-dev]
+
+- 工具集 v1(10 种):矩形/椭圆/直线(箭头:无/单/双)/折线/画笔/记号笔/马赛克/模糊/橡皮擦/序号(1-9 自动递增)。文本/放大镜标注/圆角矩形 = M3。
+- 对象模型(POCO,可 JSON 序列化):AnnotShape { Id, Type, Bounds(PxRect), ColorArgb, StrokeWidth, Filled, Dashed, Rotation, Text, Number, 点集 },容器 AnnotDocument { List<AnnotShape> }。
+- 渲染:Skia,画于冻结画面之上、遮罩之下;马赛克=区域 16px 块降采样;模糊=高斯;橡皮擦=从冻结帧重 blit 恢复原像素。
+- 工具条:空格显隐;工具按钮×10/颜色板(8 色+自定义)/粗细(1-5 笔尖)/撤销/重做/清空/输出选项;滚轮=粗细。
+- 交互:拖拽绘制;完成后单击选中(高亮框+8 锚点)可拖动/缩放;Del 删除;Ctrl+Z/Ctrl+Y 撤销重做(栈深 100);Ctrl+Shift+Z 清空。
+- 二次编辑:选中后同类型工具拖拽=改几何;改色/改粗细作用于选中形状。
+- 确认输出:最终图像=冻结帧+标注合成(选区内不再叠遮罩);SnipResult.Image 语义不变。
+- 性能红线:标注拖拽重绘 <6ms @2K。
+- 回放钩子:SnipOverlay 构造参数增加可选 IReadOnlyList<NativeBitmap> historyFrames(缺省 null);逗号/句号键循环切换冻结帧(App 的历史功能 M2b 接入)。
+
+## 10. 元素检测 v1(Core)[owner: core-dev]
+
+public sealed record ElementInfo(IntPtr WindowHandle, PxRect Bounds, string Name, string ClassName, string ControlType, int Depth);
+public sealed class ElementDetector : IDisposable {
+    public IReadOnlyList<ElementInfo> Detect(IntPtr windowHandle);  // 窗口内 UIA 树扁平化(缓存)
+    public IReadOnlyList<ElementInfo> HitTest(PxPoint screenPt);    // 点命中:叶→根元素链,空=无
+    public void Invalidate(IntPtr windowHandle);
+}
+- 实现:IUIAutomation 原生 COM interop(不引 WPF);TreeWalker 遍历,深度≤12、节点≤2000;每调用 100ms 超时线程隔离,异常吞掉返回空——绝不带崩 OpenSnip。
+- 坐标:物理像素(DPI 换算复用 DisplayManager)。
+- Overlay 的 Tab/滚轮模式切换消费 = 标注完成后联调(overlay-dev),本批 Core 交付引擎+单测(记事本/浏览器冒烟,不依赖特定应用)。
+
+## 11. 贴图进阶(Pin)[owner: pin-dev]
+
+public enum PinBackground { Transparent, PseudoTransparent, DarkCheckerboard, LightCheckerboard }
+// PinWindow 新增: public PinBackground Background { set; }
+// PinManager 新增: public static bool IsOnCurrentVirtualDesktop(PinWindow w);  // IVirtualDesktopManager COM,v1 只读
+- 伪透明=截取贴图背后屏幕内容作背景(鼠标可点透明区);创建/移动/缩放时重截,缓存随位置失效;隐藏桌面或捕获失败回退 LightCheckerboard+PerfLog。
+- 右键菜单加 背景模式 子菜单(四项)。
+
+## 12. 历史 / 命名规则 / 自动保存 / 触发角(App;触发角监视器在 Core)[owner: app-dev]
+
+// Core 新增 src/OpenSnip.Core/Input/HotCornerMonitor.cs
+public sealed class HotCornerMonitor : IDisposable {
+    public HotCornerMonitor(TimeSpan dwell);
+    public bool Enabled { set; }
+    public event Action<int>? CornerEntered;  // 0=左上 1=右上 2=左下 3=右下(钩子线程)
+}
+- 历史存储(App):成功截图 → 配置目录 history\Snip_yyyyMMdd_HHmmss_fff.png + 同名 .json 元数据;上限 100 FIFO;TestRpc 扩展 {"cmd":"history.list"};CLI history [N];回放 UI = M2b(Overlay 钩子已留)。
+- 命名规则:模板变量 $yyyy$/$MM$/$dd$/$HH$/$mm$/$ss$/$fff$/$title$/$exe$,默认 Snip_$yyyy$-MM$-$dd$_$HH$-$mm$-$ss$;非法字符过滤;-o 路径同解析。
+- 自动保存:config.ini [Output] auto-save/目录;成功截图自动落盘,独立于 -o 显式输出。
+- 触发角:App 集成,config.ini [HotCorners] enabled/dwell_ms/actions(v1 动作:show-images/hide-images/snip/paste/无);TestRpc 加 {"cmd":"corners.set","enabled":bool}。
+
+## M2a 验收
+- build/test 全绿;各模块自验:标注=探针导出 10 工具绘制 PNG 断言;元素检测=记事本冒烟;伪透明=真实桌面目测+隐藏桌面回退棋盘;历史/触发角=TestRpc/单测。
+- E2E 扩展(run-e2e v2:标注绘制驱动/pins 背景断言)由 lead 在四模块合入后统一扩展跑通。

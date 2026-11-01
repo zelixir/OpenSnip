@@ -65,6 +65,16 @@ public sealed class PinWindow : IDisposable
     private PxPoint _dragStartCursor;
     private PxPoint _dragStartWindowPos;
 
+    // ===== 背景模式状态(契约 §11;仅贴图线程访问)=====
+    private PinBackground _background = PinBackground.Transparent;   // 默认透明 = M1 行为,零变化
+    private SKBitmap? _backgroundBitmap;      // 伪透明捕获快照(与窗口同尺寸,预乘 BGRA)
+    private SKBitmap? _checkerboardBitmap;    // 棋盘缓存(尺寸/深浅不匹配时重建)
+    private PinBackground _checkerboardKind;  // 棋盘缓存对应的深浅
+    private bool _bgRefreshPending;           // WM_TIMER 防抖挂起
+    private bool _refreshingBackground;       // 重截进行中(瞬隐期间不再调度/重入)
+    private const int BgRefreshTimerId = 1;
+    private const int BgRefreshDelayMs = 150;
+
     /// <summary>窗口关闭后在贴图线程触发;触发时窗口与非托管资源已全部释放。</summary>
     public event Action<PinWindow>? Closed;
 
@@ -147,6 +157,16 @@ public sealed class PinWindow : IDisposable
     public byte OpacityPercent
     {
         set => _dispatcher.Invoke(() => ApplyOpacity(value));
+    }
+
+    /// <summary>
+    /// 背景模式(契约 §11;默认 Transparent = M1 行为;同步生效)。
+    /// 切到伪透明:立即瞬隐一帧重截当前背后的屏幕快照;之后位置/尺寸变化经 150ms 防抖自动重截。
+    /// 回退(浅棋盘 + PerfLog):窗口跨屏或出屏、截屏异常、捕获到纯黑(隐藏桌面,SPEC §8.4)。
+    /// </summary>
+    public PinBackground Background
+    {
+        set => _dispatcher.Invoke(() => ApplyBackground(value));
     }
 
     /// <summary>关闭并销毁窗口;幂等。Closed 事件随后在贴图线程触发。</summary>
@@ -273,6 +293,16 @@ public sealed class PinWindow : IDisposable
                 OnWheel(wParam);
                 return 0;
 
+            case NativeMethods.WM_TIMER:
+                if (wParam.ToInt64() == BgRefreshTimerId)
+                {
+                    // WM_TIMER 仅在队列空闲时投递:天然"静止后才刷新",拖动/连滚不频闪
+                    _ = NativeMethods.KillTimer(_hwnd, BgRefreshTimerId);
+                    _bgRefreshPending = false;
+                    RefreshPseudoBackgroundNow();
+                }
+                return 0;
+
             // WM_DPICHANGED(PMv2 跨屏拖动):v1 忽略,保持物理尺寸(贴图为物理像素快照,与 Snipaste 一致)
             default:
                 return NativeMethods.DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -329,6 +359,7 @@ public sealed class PinWindow : IDisposable
             {
                 _rect = new PxRect(x, y, w, h);
             }
+            ScheduleBackgroundRefresh();   // 位置/尺寸变化:伪透明背景缓存失效(契约 §11"移动/缩放时重截")
         }
     }
 
@@ -472,6 +503,15 @@ public sealed class PinWindow : IDisposable
             _ = NativeMethods.CheckMenuItem(menu, NativeMethods.MENU_ID_TOPMOST, _topmost ? NativeMethods.MF_CHECKED : 0);
             _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_STRING, (UIntPtr)NativeMethods.MENU_ID_CLICKTHROUGH, "鼠标穿透");
             _ = NativeMethods.CheckMenuItem(menu, NativeMethods.MENU_ID_CLICKTHROUGH, _clickThrough ? NativeMethods.MF_CHECKED : 0);
+
+            // 背景模式子菜单(契约 §11):当前模式打勾;子菜单由父菜单 DestroyMenu 一并销毁
+            IntPtr bgMenu = NativeMethods.CreatePopupMenu();
+            _ = NativeMethods.AppendMenuW(bgMenu, NativeMethods.MF_STRING, (UIntPtr)(NativeMethods.MENU_ID_BG_FIRST + 0u), "透明(默认)");
+            _ = NativeMethods.AppendMenuW(bgMenu, NativeMethods.MF_STRING, (UIntPtr)(NativeMethods.MENU_ID_BG_FIRST + 1u), "伪透明");
+            _ = NativeMethods.AppendMenuW(bgMenu, NativeMethods.MF_STRING, (UIntPtr)(NativeMethods.MENU_ID_BG_FIRST + 2u), "深色棋盘");
+            _ = NativeMethods.AppendMenuW(bgMenu, NativeMethods.MF_STRING, (UIntPtr)(NativeMethods.MENU_ID_BG_FIRST + 3u), "浅色棋盘");
+            _ = NativeMethods.CheckMenuItem(bgMenu, NativeMethods.MENU_ID_BG_FIRST + (uint)_background, NativeMethods.MF_CHECKED);
+            _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_POPUP, (UIntPtr)bgMenu, "背景模式");
             _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_SEPARATOR, UIntPtr.Zero, null);
             _ = NativeMethods.AppendMenuW(menu, NativeMethods.MF_STRING, (UIntPtr)NativeMethods.MENU_ID_CLOSE, "关闭");
 
@@ -488,17 +528,24 @@ public sealed class PinWindow : IDisposable
                 menu, NativeMethods.TPM_RETURNCMD | NativeMethods.TPM_RIGHTBUTTON, pt.X, pt.Y, hWnd, IntPtr.Zero);
             _ = NativeMethods.PostMessageW(hWnd, NativeMethods.WM_NULL, IntPtr.Zero, IntPtr.Zero);
 
-            switch (cmd)
+            if (cmd >= NativeMethods.MENU_ID_BG_FIRST && cmd < NativeMethods.MENU_ID_BG_FIRST + 4u)
             {
-                case NativeMethods.MENU_ID_TOPMOST:
-                    ApplyTopmost(!_topmost);
-                    break;
-                case NativeMethods.MENU_ID_CLICKTHROUGH:
-                    ApplyClickThrough(!_clickThrough);
-                    break;
-                case NativeMethods.MENU_ID_CLOSE:
-                    BeginDestroy();
-                    break;
+                ApplyBackground((PinBackground)(int)(cmd - NativeMethods.MENU_ID_BG_FIRST));
+            }
+            else
+            {
+                switch (cmd)
+                {
+                    case NativeMethods.MENU_ID_TOPMOST:
+                        ApplyTopmost(!_topmost);
+                        break;
+                    case NativeMethods.MENU_ID_CLICKTHROUGH:
+                        ApplyClickThrough(!_clickThrough);
+                        break;
+                    case NativeMethods.MENU_ID_CLOSE:
+                        BeginDestroy();
+                        break;
+                }
             }
         }
         finally
@@ -539,6 +586,187 @@ public sealed class PinWindow : IDisposable
         _clickThrough = value;
     }
 
+    // ==================== 背景模式(契约 §11) ====================
+
+    private void ApplyBackground(PinBackground value)
+    {
+        if (_hwnd == IntPtr.Zero || value == _background)
+        {
+            return;
+        }
+        _background = value;
+        if (value == PinBackground.PseudoTransparent)
+        {
+            RefreshPseudoBackgroundNow();   // 立即重截(内部含恢复提交)
+        }
+        else
+        {
+            DisposeBackgroundBitmaps();     // Transparent 无背景层;棋盘按需重建
+            Commit();
+        }
+    }
+
+    /// <summary>
+    /// 伪透明重截:窗口瞬隐一帧(ULW 全透明)→ 等 DWM 合成 → 截屏窗口所在屏 →
+    /// CopyRegionFrom 裁出窗口区域 → 恢复显示(新背景 + 内容)。
+    /// 前置:窗口完全落在单个显示器内(跨屏/出屏回退);失败回退浅棋盘 + PerfLog(契约 §11/§8.4)。
+    /// </summary>
+    private void RefreshPseudoBackgroundNow()
+    {
+        if (_background != PinBackground.PseudoTransparent || _hwnd == IntPtr.Zero
+            || _target is null || _scaledBitmap is null || _refreshingBackground)
+        {
+            return;
+        }
+        _refreshingBackground = true;
+        try
+        {
+            int x, y, w, h;
+            lock (_gate)
+            {
+                x = _rect.X;
+                y = _rect.Y;
+                w = _rect.Width;
+                h = _rect.Height;
+            }
+            var display = TryGetDisplayAt(new PxPoint(x + w / 2, y + h / 2));
+            // 窗口必须完全落在单个显示器内(跨屏/出屏 → 回退;同时完成可空收窄)
+            if (display is null
+                || display.Bounds.X > x || display.Bounds.Y > y
+                || x + w > display.Bounds.X + display.Bounds.Width
+                || y + h > display.Bounds.Y + display.Bounds.Height)
+            {
+                FallbackBackground("offscreen-or-cross-display", x, y, w, h);
+                return;
+            }
+
+            // 瞬隐:贴图先从屏幕上"拿开",截屏才不会把贴图自己截进背景
+            if (_lastCommitOk)
+            {
+                _ = _target.CommitTransparentFrame(_hwnd, x, y);
+            }
+            try
+            {
+                Thread.Sleep(24);   // 等 DWM 完成一帧合成,确保瞬隐帧已上屏
+                var svc = PinManager.EnsureCaptureService();
+                if (svc is null)
+                {
+                    FallbackBackground("capture-service-unavailable", x, y, w, h);
+                    return;
+                }
+                using var cap = svc.Capture(display);
+                if (IsCapturedContentBlank(cap))
+                {
+                    // 纯黑 = 隐藏桌面空桌特征(SPEC §8.4:BitBlt 在空桌面产出"合法黑")
+                    FallbackBackground("blank-capture", x, y, w, h);
+                    return;
+                }
+                var bg = NativeBitmap.Allocate(w, h);
+                bg.CopyRegionFrom(cap, x - display.Bounds.X, y - display.Bounds.Y);
+                SKBitmap premul;
+                using (var wrap = BitmapConversion.WrapAsSkia(bg))
+                {
+                    premul = PinRenderer.BuildPremulBase(wrap);
+                }
+                bg.Dispose();   // 预乘副本已建,本次捕获的 NativeBitmap 所有权在此结束
+                _backgroundBitmap?.Dispose();
+                _backgroundBitmap = premul;
+            }
+            catch (Exception ex)
+            {
+                FallbackBackground("capture-failed: " + ex.Message, x, y, w, h);
+            }
+        }
+        finally
+        {
+            Commit();   // 恢复显示:成功=新背景;失败=回退层(浅棋盘)
+            _refreshingBackground = false;
+        }
+    }
+
+    /// <summary>伪透明回退:丢弃捕获缓存(渲染层解析为浅棋盘)+ PerfLog 打点;不提交,由调用方统一恢复。</summary>
+    private void FallbackBackground(string reason, int x, int y, int w, int h)
+    {
+        _backgroundBitmap?.Dispose();
+        _backgroundBitmap = null;
+        PerfLog.Log("Pin", "bg-fallback reason=" + reason + " rect=" + x + "," + y + " " + w + "x" + h);
+    }
+
+    /// <summary>位置/尺寸变化后调度伪透明重截(150ms 防抖:拖动/连滚不频闪,静止后一次截屏)。</summary>
+    private void ScheduleBackgroundRefresh()
+    {
+        if (_background != PinBackground.PseudoTransparent || _hwnd == IntPtr.Zero
+            || _bgRefreshPending || _refreshingBackground)
+        {
+            return;
+        }
+        _bgRefreshPending = true;
+        _ = NativeMethods.SetTimer(_hwnd, BgRefreshTimerId, BgRefreshDelayMs, IntPtr.Zero);
+    }
+
+    /// <summary>Commit 的背景层解析:伪透明=快照(缺/失效→浅棋盘回退);棋盘模式=棋盘;Transparent=null(逐像素 alpha)。</summary>
+    private SKBitmap? GetBackgroundLayerForRender(int w, int h)
+    {
+        switch (_background)
+        {
+            case PinBackground.PseudoTransparent:
+                return _backgroundBitmap ?? GetCheckerboard(dark: false, w, h);
+            case PinBackground.DarkCheckerboard:
+                return GetCheckerboard(dark: true, w, h);
+            case PinBackground.LightCheckerboard:
+                return GetCheckerboard(dark: false, w, h);
+            default:
+                return null;
+        }
+    }
+
+    private SKBitmap GetCheckerboard(bool dark, int w, int h)
+    {
+        var kind = dark ? PinBackground.DarkCheckerboard : PinBackground.LightCheckerboard;
+        if (_checkerboardBitmap is null || _checkerboardKind != kind
+            || _checkerboardBitmap.Width != w || _checkerboardBitmap.Height != h)
+        {
+            _checkerboardBitmap?.Dispose();
+            float dpi = TryGetDisplayAt(new PxPoint(_rect.X + w / 2, _rect.Y + h / 2))?.DpiScale ?? 1f;
+            _checkerboardBitmap = PinRenderer.BuildCheckerboard(dark, w, h, dpi);
+            _checkerboardKind = kind;
+        }
+        return _checkerboardBitmap;
+    }
+
+    /// <summary>捕获内容是否纯黑(24×24 网格采样)。真实桌面几乎不可能全黑;隐藏桌面 BitBlt 恒黑(SPEC §8.4)。</summary>
+    private static unsafe bool IsCapturedContentBlank(NativeBitmap cap)
+    {
+        const int grid = 24;
+        byte* p = (byte*)cap.Scan0;
+        for (int gy = 0; gy < grid; gy++)
+        {
+            int y = (int)((long)gy * (cap.Height - 1) / (grid - 1));
+            byte* row = p + (nint)((long)y * cap.Stride);
+            for (int gx = 0; gx < grid; gx++)
+            {
+                int x = (int)((long)gx * (cap.Width - 1) / (grid - 1));
+                int off = x * 4;
+                if (row[off] != 0 || row[off + 1] != 0 || row[off + 2] != 0)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private void DisposeBackgroundBitmaps()
+    {
+        _backgroundBitmap?.Dispose();
+        _backgroundBitmap = null;
+        _checkerboardBitmap?.Dispose();
+        _checkerboardBitmap = null;
+    }
+
+    /// <summary>存活句柄(已销毁返回 IntPtr.Zero;供虚拟桌面查询等跨线程使用)。</summary>
+    internal IntPtr GetLiveHwnd() => Volatile.Read(ref _destroyed) == 1 ? IntPtr.Zero : _hwnd;
+
     // ==================== 渲染管线 ====================
 
     /// <summary>构建基准(原尺寸预乘)位图与当前缩放位图;仅构造期在贴图线程调用一次。</summary>
@@ -554,20 +782,23 @@ public sealed class PinWindow : IDisposable
             ?? throw new OutOfMemoryException("贴图初始重采样失败");
     }
 
-    /// <summary>把当前内容(含透明度)ULW 提交到屏幕;仅贴图线程调用。</summary>
+    /// <summary>把当前内容(含背景层与透明度)ULW 提交到屏幕;仅贴图线程调用。</summary>
     private void Commit()
     {
         if (_hwnd == IntPtr.Zero || _target is null || _scaledBitmap is null)
         {
             return;
         }
-        int x, y;
+        int x, y, w, h;
         lock (_gate)
         {
             x = _rect.X;
             y = _rect.Y;
+            w = _rect.Width;
+            h = _rect.Height;
         }
-        _lastCommitOk = _target.Commit(_hwnd, x, y, _scaledBitmap, _opacity);
+        var background = GetBackgroundLayerForRender(w, h);
+        _lastCommitOk = _target.Commit(_hwnd, x, y, _scaledBitmap, _opacity, background);
     }
 
     // ==================== 销毁与清理 ====================
@@ -599,6 +830,8 @@ public sealed class PinWindow : IDisposable
         }
 
         _ = WindowMap.TryRemove(hWnd, out _);
+        _ = NativeMethods.KillTimer(hWnd, BgRefreshTimerId);
+        _bgRefreshPending = false;
         _hwnd = IntPtr.Zero;
         _dragging = false;
 
@@ -608,6 +841,10 @@ public sealed class PinWindow : IDisposable
         _baseBitmap = null;
         _target?.Dispose();
         _target = null;
+        _backgroundBitmap?.Dispose();
+        _backgroundBitmap = null;
+        _checkerboardBitmap?.Dispose();
+        _checkerboardBitmap = null;
         _image.Dispose();   // 位图所有权:窗口关闭即释放(契约 §3.3)
         if (_selfHandle.IsAllocated)
         {

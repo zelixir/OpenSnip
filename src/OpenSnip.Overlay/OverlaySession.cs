@@ -2,7 +2,9 @@
 // 状态:Hover(空闲悬停,窗口高亮)→ 拖拽初选 → Selected(锚点调整/整体移动/方向键微调)。
 using System.Collections.Generic;
 using OpenSnip.Core;
+using OpenSnip.Overlay.Annotation;
 using OpenSnip.Overlay.Interop;
+using SkiaSharp;
 
 namespace OpenSnip.Overlay;
 
@@ -27,6 +29,7 @@ internal sealed class OverlaySession
     private readonly HashSet<IntPtr> _selfHwnds;               // 自身遮罩窗口,窗口命中检测需过滤
     private readonly WindowHitTester? _hitTester;
     private readonly PxRect _virtualDesktop;                   // 各屏 Bounds 包围盒(移动选区时夹取)
+    private readonly Func<DisplayInfo, SKImage?>? _frozenImageProvider; // §9 合成用:display → 冻结帧(窗口 FrozenImage)
 
     // —— 悬停窗口(§2.4:HitTopToBottom 列表 + 滚轮切层级)——
     private IReadOnlyList<WindowInfo> _hits = Array.Empty<WindowInfo>();
@@ -44,15 +47,20 @@ internal sealed class OverlaySession
     public PxRect? HoverRect { get; private set; }             // 当前高亮窗口矩形
     public DragKind Drag { get; private set; } = DragKind.None;
 
-    /// <summary>放大镜可见性:非拖拽状态可见(Snipaste 风格),任何拖拽中隐藏。</summary>
+    /// <summary>放大镜可见性:非拖拽状态可见(Snipaste 风格),任何拖拽中隐藏;标注模式下由工具条替代。</summary>
     public bool WantsMagnifier => Drag == DragKind.None && Cursor is not null;
 
+    /// <summary>M2a 标注控制器(SPEC §9):Selected 相位时优先消费鼠标/滚轮/键盘。</summary>
+    public AnnotationController Annot { get; } = new();
+
     public OverlaySession(IReadOnlyList<DisplayInfo> displays,
-        Dictionary<int, NativeBitmap?> frozen, HashSet<IntPtr> selfHwnds)
+        Dictionary<int, NativeBitmap?> frozen, HashSet<IntPtr> selfHwnds,
+        Func<DisplayInfo, SKImage?>? frozenImageProvider = null)
     {
         _displays = displays;
         _frozen = frozen;
         _selfHwnds = selfHwnds;
+        _frozenImageProvider = frozenImageProvider;
         _virtualDesktop = ComputeVirtualDesktop(displays);
         try { _hitTester = new WindowHitTester(); }
         catch { _hitTester = null; } // Core 不可用时仅失去窗口高亮,手选流程不受影响
@@ -63,6 +71,9 @@ internal sealed class OverlaySession
     public void OnMouseMove(PxPoint pt)
     {
         Cursor = pt;
+        // M2a:标注层拖拽(绘制/移动/缩放/重画)优先于 M1 路由
+        if (Phase == SnipPhase.Selected && Annot.HandleMouseMove(pt))
+            return;
         switch (Drag)
         {
             case DragKind.None when Phase == SnipPhase.Hover:
@@ -73,9 +84,11 @@ internal sealed class OverlaySession
                 break;
             case DragKind.Move:
                 Selection = ClampToDesktop(OverlayGeometry.Offset(_dragStartRect, pt.X - _dragStartPt.X, pt.Y - _dragStartPt.Y));
+                Annot.OnSelectionChanged(Selection.Value, _virtualDesktop.Width, _virtualDesktop.Height, DpiOf(pt));
                 break;
             case DragKind.Anchor:
                 Selection = OverlayGeometry.AdjustFromAnchor(Selection!.Value, _anchorIndex, pt);
+                Annot.OnSelectionChanged(Selection.Value, _virtualDesktop.Width, _virtualDesktop.Height, DpiOf(pt));
                 break;
         }
     }
@@ -83,6 +96,9 @@ internal sealed class OverlaySession
     public void OnLeftButtonDown(PxPoint pt)
     {
         Cursor = pt;
+        // M2a:工具条/形状选中/绘制优先(Selected 相位)
+        if (Phase == SnipPhase.Selected && Selection is { } s0 && Annot.HandleMouseDown(pt))
+            return;
         switch (Phase)
         {
             case SnipPhase.Hover:
@@ -120,6 +136,9 @@ internal sealed class OverlaySession
     public void OnLeftButtonUp(PxPoint pt)
     {
         Cursor = pt;
+        // M2a:标注层抬起(绘制提交/拖动结束)
+        if (Phase == SnipPhase.Selected && Annot.HandleMouseUp(pt))
+            return;
         if (Drag == DragKind.Create)
         {
             var r = OverlayGeometry.Normalize(_dragStartPt, pt);
@@ -146,7 +165,18 @@ internal sealed class OverlaySession
         }
         Drag = DragKind.None;
         _anchorIndex = -1;
+        if (Phase == SnipPhase.Selected && Selection is { } selNew)
+            Annot.OnSelectionChanged(selNew, _virtualDesktop.Width, _virtualDesktop.Height, DpiOf(pt));
         if (Phase == SnipPhase.Hover) ProbeHover(pt); // 拖拽结束恢复窗口高亮
+    }
+
+    /// <summary>光标所在屏的 DPI(无屏则 1;退而求其次用选区中心所在屏)。</summary>
+    private float DpiOf(PxPoint pt)
+    {
+        var d = FindDisplay(pt);
+        if (d is null && Selection is { } s)
+            d = FindDisplay(new PxPoint(s.X + s.Width / 2, s.Y + s.Height / 2));
+        return d?.DpiScale ?? 1f;
     }
 
     /// <summary>
@@ -179,12 +209,18 @@ internal sealed class OverlaySession
     {
         if (Phase != SnipPhase.Selected || Selection is not { } s) return false;
         Selection = ClampToDesktop(OverlayGeometry.Offset(s, dx, dy));
+        var ns = Selection.Value;
+        Annot.OnSelectionChanged(ns, _virtualDesktop.Width, _virtualDesktop.Height,
+            DpiOf(new PxPoint(ns.X + ns.Width / 2, ns.Y + ns.Height / 2)));
         return true;
     }
 
     /// <summary>滚轮:切换高亮窗口的 Z 层级(§2.4 用整个命中列表)。返回 true 表示有变化。</summary>
     public bool OnWheel(int delta)
     {
+        // M2a:指针在工具条上 = 调粗细(SPEC §9)
+        if (Phase == SnipPhase.Selected && Cursor is { } c && Annot.HandleWheel(c, delta))
+            return true;
         if (_hits.Count == 0) return false;
         _hoverIndex = Math.Clamp(_hoverIndex + (delta < 0 ? 1 : -1), 0, _hits.Count - 1);
         HoverRect = _hits[_hoverIndex].Bounds;
@@ -235,7 +271,10 @@ internal sealed class OverlaySession
             CursorPt: Cursor,
             MagnifierHex: WantsMagnifier ? GetMagnifierHex() : null,
             ShowMagnifier: WantsMagnifier,
-            DpiScale: w.Display.DpiScale);
+            DpiScale: w.Display.DpiScale,
+            Shapes: Annot.Document.Shapes,
+            SelectedShape: Annot.Selected,
+            Toolbar: Annot.Toolbar);
     }
 
     /// <summary>
@@ -277,7 +316,45 @@ internal sealed class OverlaySession
             }
         }
 
-        return new SnipResult(result, sel, PickPrimaryDisplay(sel));
+        // —— §9:确认输出 = 冻结帧 + 标注合成(选区内不再叠遮罩;M1 裁剪本就不含遮罩)——
+        var primary = PickPrimaryDisplay(sel);
+        if (Annot.Document.Shapes.Count > 0)
+            CompositeAnnotations(result, sel, primary);
+
+        return new SnipResult(result, sel, primary);
+    }
+
+    /// <summary>
+    /// 把标注合成为最终输出。前提:冻结帧 alpha 全 255(EnsureOpaque 保证)→
+    /// 非预乘 BGRA 的位模式与预乘一致,直接把结果 NativeBitmap 按预乘包装原地合成,零回写拷贝。
+    /// 马赛克/模糊/橡皮擦的像素源 = 主判定屏的冻结画面(经构造参数注入的 provider 零拷贝取用)。
+    /// </summary>
+    private void CompositeAnnotations(NativeBitmap result, PxRect sel, DisplayInfo primary)
+    {
+        try
+        {
+            var wrap = new SKBitmap();
+            if (!wrap.InstallPixels(
+                    new SKImageInfo(result.Width, result.Height, SKColorType.Bgra8888, SKAlphaType.Premul),
+                    result.Scan0, result.Stride))
+            {
+                wrap.Dispose();
+                PerfLog.Log("Overlay.Confirm", "annotate composite: InstallPixels failed");
+                return;
+            }
+            using (wrap)
+            using (var canvas = new SKCanvas(wrap))
+            {
+                canvas.Translate(-sel.X, -sel.Y);
+                AnnotationRenderer.Draw(canvas, Annot.Document.Shapes,
+                    _frozenImageProvider?.Invoke(primary), Annot.Selected, new PxPoint(0, 0), (float)primary.DpiScale);
+                canvas.Flush();
+            }
+        }
+        catch (Exception ex)
+        {
+            PerfLog.Log("Overlay.Confirm", $"annotate composite FAILED: {ex.Message}");
+        }
     }
 
     // —————————————————— 内部 ——————————————————

@@ -51,7 +51,9 @@ public partial class App : Application
                 PerfLog.Log("App", $"ipc:relayed-to-first-instance block={options.Block} status={relay.Status} ok={relay.Ok} msg={relay.Message}");
                 if (options.Block)
                 {
-                    Console.WriteLine(relay.Ok ? "[OpenSnip] OK" : $"[OpenSnip] ERR {relay.Message}");
+                    Console.WriteLine(relay.Ok
+                    ? (string.IsNullOrEmpty(relay.Message) ? "[OpenSnip] OK" : "[OpenSnip] OK " + relay.Message)
+                    : $"[OpenSnip] ERR {relay.Message}");
                 }
                 Shutdown(relay.ExitCode);
                 return;
@@ -76,7 +78,9 @@ public partial class App : Application
             if (options.Command != CliCommandKind.None)
             {
                 var (ok, err) = await _orchestrator.ExecuteAsync(options, "cli-startup");
-                Console.WriteLine(ok ? "[OpenSnip] OK" : $"[OpenSnip] ERR {err}");
+                Console.WriteLine(ok
+                    ? (string.IsNullOrEmpty(err) ? "[OpenSnip] OK" : "[OpenSnip] OK " + err)
+                    : $"[OpenSnip] ERR {err}");
             }
         }
         catch (Exception ex)
